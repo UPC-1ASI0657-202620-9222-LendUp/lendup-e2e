@@ -1,0 +1,1 @@
+{"name":"lendup-e2e-scripts","private":true,"type":"module","dependencies":{"ajv":"8.17.1","ajv-formats":"3.0.1","newman":"6.2.1","newman-reporter-htmlextra":"1.23.1"}}
