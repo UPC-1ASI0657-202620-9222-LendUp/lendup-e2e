@@ -1,0 +1,271 @@
+# Todo LendUp en local: un solo RabbitMQ y un solo MySQL (un esquema y un usuario por servicio).
+# Reales: Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación y API Gateway, construidos desde las
+# carpetas vecinas. Firebase es el emulador oficial de Google y Mercado Pago el modo simulado de Pagos. Evidencias todavía
+# no tiene microservicio: el gateway lo manda al "monolito" (stubs/monolito.mjs). No necesita ninguna credencial real.
+name: lendup-tf-e2e
+
+x-app: &app
+  restart: unless-stopped
+  volumes: ["./.generated/firebase-local.json:/run/secrets/firebase.json:ro"]
+  depends_on: &app-deps
+    schemas: { condition: service_completed_successfully }
+    rabbitmq: { condition: service_healthy }
+    firebase: { condition: service_healthy }
+# Préstamos, Pagos, Notificaciones y Reservas corren además endurecidos (solo lectura y sin privilegios).
+x-hardened: &hardened
+  <<: *app
+  read_only: true
+  tmpfs: ["/tmp:rw,noexec,nosuid,size=64m"]
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+x-firebase: &firebase-env
+  FIREBASE_PROJECT_ID: lendup-desarrollo
+  FIREBASE_AUTH_EMULATOR_HOST: firebase:9099
+  GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/firebase.json
+x-common: &common
+  <<: *firebase-env
+  RABBITMQ_HOST: rabbitmq
+  RABBITMQ_PORT: 5672
+  RABBITMQ_USERNAME: lendup
+  RABBITMQ_PASSWORD: ${RABBITMQ_PASSWORD}
+  CORS_ORIGINS: http://localhost:3000,http://localhost:5173
+  IDENTITY_SERVICE_BASE_URL: http://identity:8081
+x-reputation: &reputation-env
+  <<: *firebase-env
+  ENVIRONMENT: development
+  DATABASE_URL: mysql+pymysql://lendup_reputacion:${DB_PASSWORD}@mysql:3306/lendup_reputacion?charset=utf8mb4
+  IDENTITY_BASE_URL: http://identity:8081
+  RABBITMQ_URL: amqp://lendup:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2F
+  # Reputación se acopla solo con configuración: mismo exchange del equipo y las rutas que ella propone.
+  RABBITMQ_EXCHANGE: lendup.domain.events
+  RABBITMQ_LOAN_QUEUE: lendup.reputation.loan-finalized.v1
+  RABBITMQ_LOAN_ROUTING_KEY: loans.loan-finalized.v1
+  RABBITMQ_RATING_ROUTING_KEY: reputation.rating-registered.v1
+  RABBITMQ_DLQ: lendup.reputation.loan-finalized.v1.dlq
+  RABBITMQ_RETRY_QUEUE: lendup.reputation.loan-finalized.v1.retry
+  LOAN_SUBSCRIPTION_ENABLED: "true"
+  OUTBOX_PUBLISHER_ENABLED: "true"
+  CORS_ORIGINS: '["http://localhost:5173"]'
+
+services:
+  # ---- infraestructura ----
+  mysql:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: "${MYSQL_ROOT_PASSWORD}", TZ: UTC }
+    ports: ["127.0.0.1:3320:3306"]
+    volumes: ["mysql-data:/var/lib/mysql"]
+    healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 5s, timeout: 5s, retries: 40 }
+  schemas: # crea (una sola vez) el esquema y el usuario de cada servicio
+    image: mysql:8.4
+    environment: { MYSQL_PWD: "${MYSQL_ROOT_PASSWORD}" }
+    entrypoint: ["sh", "-c", "mysql -h mysql -uroot < /sql/01-schemas.sql"]
+    volumes: ["./.generated/mysql-init:/sql:ro"]
+    depends_on: { mysql: { condition: service_healthy } }
+  rabbitmq:
+    image: rabbitmq:4.2-management-alpine
+    environment: { RABBITMQ_DEFAULT_USER: lendup, RABBITMQ_DEFAULT_PASS: "${RABBITMQ_PASSWORD}" }
+    ports: ["127.0.0.1:5680:5672", "127.0.0.1:15680:15672"]
+    healthcheck: { test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"], interval: 5s, timeout: 5s, retries: 40 }
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+  firebase:
+    build: { context: ./firebase }
+    image: lendup-firebase-emulator
+    ports: ["127.0.0.1:9099:9099"]
+    healthcheck: { test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:9099/').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"], interval: 5s, timeout: 5s, retries: 40 }
+  monolito:
+    image: node:24-alpine
+    command: ["node", "/app/monolito.mjs"]
+    volumes: ["./stubs/monolito.mjs:/app/monolito.mjs:ro"]
+    healthcheck: { test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/health"], interval: 3s, timeout: 3s, retries: 20 }
+
+  # ---- Identidad y Catálogo ----
+  identity-migrate:
+    build: { context: ../lendup-identity-service }
+    image: lendup-tf-e2e-identity
+    command: ["node", "scripts/migrate.cjs"]
+    environment: &identity-env
+      <<: *firebase-env
+      PORT: 8081
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: lendup_identidad
+      DB_USERNAME: lendup_identidad
+      DB_PASSWORD: ${DB_PASSWORD}
+      TERMS_VERSION: "2026-10-04"
+      CORS_ORIGINS: http://localhost:5173
+      IDENTITY_RESERVATIONS_SERVICE_TOKEN: ${IDENTITY_RESERVATIONS_SERVICE_TOKEN}
+      IDENTITY_PAYMENTS_SERVICE_TOKEN: ${IDENTITY_PAYMENTS_SERVICE_TOKEN}
+      IDENTITY_NOTIFICATIONS_SERVICE_TOKEN: ${IDENTITY_NOTIFICATIONS_SERVICE_TOKEN}
+    depends_on: { schemas: { condition: service_completed_successfully } }
+  identity:
+    <<: *app
+    image: lendup-tf-e2e-identity
+    environment: *identity-env
+    # 8084 es Catálogo: comparte la red de Identidad porque en desarrollo solo acepta Identidad por http en localhost.
+    ports: ["127.0.0.1:8085:8081", "127.0.0.1:8084:8082"]
+    networks: { default: { aliases: [catalog] } }
+    depends_on:
+      <<: *app-deps
+      identity-migrate: { condition: service_completed_successfully }
+  catalog-migrate:
+    image: flyway/flyway:11.14.1
+    command: ["migrate"]
+    environment:
+      FLYWAY_URL: jdbc:mysql://mysql:3306/lendup_catalogo?allowPublicKeyRetrieval=true&useSSL=false
+      FLYWAY_USER: lendup_catalogo
+      FLYWAY_PASSWORD: ${DB_PASSWORD}
+    volumes: ["../lendup-catalog-service/src/LendUp.Catalogo.Infrastructure/Database/Migrations:/flyway/sql:ro"]
+    depends_on: { schemas: { condition: service_completed_successfully } }
+  catalog:
+    <<: *app
+    build: { context: ../lendup-catalog-service }
+    network_mode: "service:identity"
+    environment:
+      <<: *firebase-env
+      ASPNETCORE_ENVIRONMENT: Development
+      SERVER_PORT: 8082
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: lendup_catalogo
+      DB_USERNAME: lendup_catalogo
+      DB_PASSWORD: ${DB_PASSWORD}
+      REDIS_ENABLED: "true"
+      REDIS_CONNECTION: redis:6379,abortConnect=false,connectTimeout=500,syncTimeout=500,asyncTimeout=500
+      CATALOGO_FIREBASE_ENABLED: "true"
+      IDENTITY_BASE_URL: http://localhost:8081
+      CATALOG_RESERVATIONS_SERVICE_TOKEN: ${CATALOG_RESERVATIONS_SERVICE_TOKEN}
+    depends_on:
+      <<: *app-deps
+      catalog-migrate: { condition: service_completed_successfully }
+      identity: { condition: service_healthy }
+      redis: { condition: service_started }
+
+  # ---- Reservas y Reputación ----
+  reservations:
+    <<: *hardened
+    build: { context: ../lendup-reservations-service }
+    environment:
+      <<: *common
+      SERVER_PORT: 8081
+      DB_URL: jdbc:mysql://mysql:3306/lendup_reservas?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: lendup_reservas
+      DB_PASSWORD: ${DB_PASSWORD}
+      IDENTITY_SERVICE_TOKEN: ${IDENTITY_RESERVATIONS_SERVICE_TOKEN}
+      IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
+      IDENTITY_ELIGIBILITY_URI_TEMPLATE: /internal/v1/identidad/usuarios/{usuario_id}/elegibilidad
+      IDENTITY_AUTHORIZED_CONTACT_URI_TEMPLATE: /internal/v1/identidad/usuarios/{usuario_id}/contacto?reserva_id={reserva_id}
+      CATALOG_SERVICE_BASE_URL: http://catalog:8082
+      CATALOG_SERVICE_TOKEN: ${CATALOG_RESERVATIONS_SERVICE_TOKEN}
+      CATALOG_SNAPSHOT_URI_TEMPLATE: /internal/v1/catalogo/publicaciones/{id}/snapshot?desde={desde}&hasta={hasta}
+      LOAN_SERVICE_BASE_URL: http://loans:8087
+      LOAN_SERVICE_TOKEN: ${LOANS_RESERVATIONS_SERVICE_TOKEN}
+      LOAN_CONTACT_ACCESS_URI_TEMPLATE: /internal/v1/prestamos/reservas/{reserva_id}/participantes/{usuario_id}/contacto
+    ports: ["127.0.0.1:8081:8081"]
+  reputation-migrate:
+    build: { context: ../lendup-reputation-service }
+    image: lendup-tf-e2e-reputation
+    command: ["alembic", "upgrade", "head"]
+    environment: *reputation-env
+    depends_on: { schemas: { condition: service_completed_successfully } }
+  reputation:
+    <<: *app
+    image: lendup-tf-e2e-reputation
+    environment: *reputation-env
+    ports: ["127.0.0.1:8086:8082"]
+    depends_on:
+      <<: *app-deps
+      reputation-migrate: { condition: service_completed_successfully }
+  reputation-consumer:
+    <<: *app
+    image: lendup-tf-e2e-reputation
+    command: ["python", "-m", "lendup_reputation.workers.loan_consumer"]
+    environment: *reputation-env
+    depends_on:
+      <<: *app-deps
+      reputation-migrate: { condition: service_completed_successfully }
+  reputation-outbox:
+    <<: *app
+    image: lendup-tf-e2e-reputation
+    command: ["python", "-m", "lendup_reputation.workers.outbox_publisher"]
+    environment: *reputation-env
+    depends_on:
+      <<: *app-deps
+      reputation-migrate: { condition: service_completed_successfully }
+
+  # ---- Préstamos, Pagos y Notificaciones ----
+  loans:
+    <<: *hardened
+    build: { context: ../lendup-loans-service }
+    environment:
+      <<: *common
+      SERVER_PORT: 8087
+      DB_URL: jdbc:mysql://mysql:3306/lendup_prestamos?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: lendup_prestamos
+      DB_PASSWORD: ${DB_PASSWORD}
+      IDENTITY_FIREBASE_USER_URI_TEMPLATE: /api/v1/estudiantes/me
+      LOANS_RESERVATIONS_SERVICE_TOKEN: ${LOANS_RESERVATIONS_SERVICE_TOKEN}
+      OVERDUE_CHECK_DELAY_MS: 2000
+      SPRINGDOC_ENABLED: "true"
+      SWAGGER_PUBLIC: "true"
+    ports: ["127.0.0.1:8087:8087"]
+  payments:
+    <<: *hardened
+    build: { context: ../lendup-payments-service }
+    environment:
+      <<: *common
+      SERVER_PORT: 8082
+      DB_URL: jdbc:mysql://mysql:3306/lendup_pagos?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
+      DB_USERNAME: lendup_pagos
+      DB_PASSWORD: ${DB_PASSWORD}
+      IDENTITY_SERVICE_TOKEN: ${IDENTITY_PAYMENTS_SERVICE_TOKEN}
+      IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
+      LENDUP_COMMISSION_PERCENT: ${LENDUP_COMMISSION_PERCENT:-18}
+      MERCADOPAGO_MODE: simulado
+      MERCADOPAGO_SIMULATOR_BASE_URL: http://localhost:8082
+      MERCADOPAGO_WEBHOOK_SECRET: ${MERCADOPAGO_WEBHOOK_SECRET}
+      SPRINGDOC_ENABLED: "true"
+      SWAGGER_PUBLIC: "true"
+    ports: ["127.0.0.1:8082:8082"]
+  notifications:
+    <<: *hardened
+    build: { context: ../lendup-notifications-service }
+    environment:
+      <<: *common
+      SERVER_PORT: 8083
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_NAME: lendup_notificaciones
+      DB_USERNAME: lendup_notificaciones
+      DB_PASSWORD: ${DB_PASSWORD}
+      IDENTITY_SERVICE_TOKEN: ${IDENTITY_NOTIFICATIONS_SERVICE_TOKEN}
+      IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
+      IDENTITY_USER_EMAIL_URI_TEMPLATE: /internal/v1/identidad/usuarios/{usuario_id}/correo
+      SENDGRID_API_KEY: ${SENDGRID_API_KEY:-}
+      SENDGRID_FROM_EMAIL: ${SENDGRID_FROM_EMAIL:-no-reply@lendup.example}
+      SENDGRID_FROM_NAME: LendUp
+      REMINDER_SCHEDULER_DELAY_MS: 3000
+      SWAGGER_ENABLED: "true"
+      SWAGGER_PUBLIC: "true"
+    ports: ["127.0.0.1:8083:8083"]
+
+  gateway:
+    restart: unless-stopped
+    build: { context: ../lendup-api-gateway }
+    environment:
+      SERVER_PORT: 8090
+      CORS_ORIGINS: http://localhost:3000,http://localhost:5173
+      MONOLITH_URL: http://monolito:8080
+      IDENTITY_SERVICE_URL: http://identity:8081
+      CATALOG_SERVICE_URL: http://catalog:8082
+      RESERVATIONS_SERVICE_URL: http://reservations:8081
+      LOANS_SERVICE_URL: http://loans:8087
+      PAYMENTS_SERVICE_URL: http://payments:8082
+      NOTIFICATIONS_SERVICE_URL: http://notifications:8083
+      REPUTATION_SERVICE_URL: http://reputation:8082
+    ports: ["127.0.0.1:8090:8090"]
+    depends_on: { monolito: { condition: service_healthy } }
+
+volumes:
+  mysql-data:
