@@ -1,19 +1,19 @@
 # Pruebas integradas de LendUp (local)
 
-Levanta todo LendUp en un solo RabbitMQ y un solo MySQL (un esquema y un usuario por servicio), construido desde las carpetas vecinas. **No necesita ninguna credencial.**
+Levanta LendUp en un RabbitMQ y un MySQL con un esquema y un usuario por servicio. Compose construye las imágenes desde las carpetas vecinas y usa credenciales locales generadas por `setup.mjs`.
 
 Clona este repositorio junto a los de los servicios, con sus nombres originales:
 
 ```powershell
-foreach ($r in "e2e","identity-service","catalog-service","reservations-service","loans-service","payments-service","notifications-service","reputation-service","api-gateway") { git clone "https://github.com/UPC-1ASI0657-202620-9222-LendUp/lendup-$r" }
+foreach ($r in "e2e","identity-service","catalog-service","reservations-service","loans-service","payments-service","notifications-service","reputation-service","evidence-service","api-gateway") { git clone "https://github.com/UPC-1ASI0657-202620-9222-LendUp/lendup-$r" }
 ```
 
 | Real | Simulado |
 |---|---|
-| Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación y API Gateway | Firebase: emulador oficial de Google |
+| Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación, Evidencias y API Gateway | Firebase: emulador oficial de Google |
 | MySQL, RabbitMQ y Redis | Mercado Pago: `MERCADOPAGO_MODE=simulado` de Pagos |
 | | SendGrid: los correos quedan en el log (o se envían si pones `SENDGRID_API_KEY` en `.env`) |
-| | Evidencias: aún no existe; sus dos eventos se publican a mano y sus rutas van al "monolito" (`stubs/monolito.mjs`) |
+| | Cloudinary y Gemini: dobles deterministas de `stubs/evidence_providers.py` |
 
 ## Preparar (una sola vez)
 
@@ -28,15 +28,18 @@ node scripts/configurar.mjs
 
 `setup.mjs` crea `.env` con contraseñas aleatorias y una cuenta de Firebase falsa. `configurar.mjs` crea el `.env` de Pagos, Notificaciones, Préstamos y el gateway para correr cada uno por separado. Ninguno sobrescribe lo que ya exista.
 
+En entornos existentes, ejecuta de nuevo `node scripts/setup.mjs`. Agrega las credenciales ausentes y actualiza el SQL de aprovisionamiento. Compose aplica ese SQL sobre el volumen de MySQL y ejecuta `evidence-migrate` antes de iniciar Evidencias.
+
 ## Todo junto
 
+Usa las ramas coordinadas de los servicios con `compose.yaml`. La suite realiza el registro de evidencias, los reportes y las resoluciones por HTTP. Usa la inyección de mensajes para las pruebas de redifusión y orden de entrega. Interrumpe RabbitMQ y reinicia servicios de forma controlada para comprobar recuperación.
+
 ```powershell
-docker compose up -d --build
+docker compose up -d --build --wait
 node scripts/e2e.mjs
-docker compose down
 ```
 
-`docker compose down -v` borra también los datos. Reporte: `reportes/e2e.md`.
+La ejecución escribe `reportes/e2e-ocho-microservicios.md` y conserva `reportes/e2e-coordinado.md` como línea base.
 
 | Servicio | URL |
 |---|---|
@@ -48,6 +51,7 @@ docker compose down
 | Identidad | http://localhost:8085/docs |
 | Reputación | http://localhost:8086/docs |
 | Préstamos | http://localhost:8087/swagger-ui.html |
+| Evidencias | http://localhost:8088/docs |
 | Emulador de Firebase | http://localhost:9099 |
 | RabbitMQ (consola) | http://localhost:15680 (usuario `lendup`, `RABBITMQ_PASSWORD` de `.env`) |
 | MySQL | `localhost:3320` |
