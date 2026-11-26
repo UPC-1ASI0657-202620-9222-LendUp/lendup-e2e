@@ -1,7 +1,6 @@
 # Todo LendUp en local: un solo RabbitMQ y un solo MySQL (un esquema y un usuario por servicio).
-# Reales: Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación y API Gateway, construidos desde las
-# carpetas vecinas. Firebase es el emulador oficial de Google y Mercado Pago el modo simulado de Pagos. Evidencias todavía
-# no tiene microservicio: el gateway lo manda al "monolito" (stubs/monolito.mjs). No necesita ninguna credencial real.
+# Ocho microservicios y API Gateway, construidos desde las carpetas vecinas.
+# Firebase usa el emulador oficial. Mercado Pago, Cloudinary y Gemini tienen dobles locales.
 name: lendup-tf-e2e
 
 x-app: &app
@@ -55,7 +54,7 @@ services:
     ports: ["127.0.0.1:3320:3306"]
     volumes: ["mysql-data:/var/lib/mysql"]
     healthcheck: { test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"], interval: 5s, timeout: 5s, retries: 40 }
-  schemas: # crea (una sola vez) el esquema y el usuario de cada servicio
+  schemas: # aprovisionamiento idempotente sobre el volumen actual
     image: mysql:8.4
     environment: { MYSQL_PWD: "${MYSQL_ROOT_PASSWORD}" }
     entrypoint: ["sh", "-c", "mysql -h mysql -uroot < /sql/01-schemas.sql"]
@@ -99,6 +98,7 @@ services:
       IDENTITY_PAYMENTS_SERVICE_TOKEN: ${IDENTITY_PAYMENTS_SERVICE_TOKEN}
       IDENTITY_NOTIFICATIONS_SERVICE_TOKEN: ${IDENTITY_NOTIFICATIONS_SERVICE_TOKEN}
       IDENTITY_LOANS_SERVICE_TOKEN: ${IDENTITY_LOANS_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      IDENTITY_EVIDENCE_SERVICE_TOKEN: ${IDENTITY_EVIDENCE_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
     depends_on: { schemas: { condition: service_completed_successfully } }
   identity:
     <<: *app
@@ -162,7 +162,10 @@ services:
       CATALOG_SNAPSHOT_URI_TEMPLATE: /internal/v1/catalogo/publicaciones/{id}/snapshot?desde={desde}&hasta={hasta}
       LOAN_SERVICE_BASE_URL: http://loans:8087
       LOAN_SERVICE_TOKEN: ${LOANS_RESERVATIONS_SERVICE_TOKEN}
+      RESERVATIONS_EVIDENCE_SERVICE_TOKEN: ${RESERVATIONS_EVIDENCE_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
       LOAN_CONTACT_ACCESS_URI_TEMPLATE: /internal/v1/prestamos/reservas/{reserva_id}/participantes/{usuario_id}/contacto
+      LENDUP_EXTENSIONS_HOLD_SECONDS: "35"
+      LENDUP_CANCELLATIONS_RECOVERY: "true"
     ports: ["127.0.0.1:8081:8081"]
   reputation-migrate:
     build: { context: ../lendup-reputation-service }
@@ -208,6 +211,14 @@ services:
       IDENTITY_SERVICE_TOKEN: ${IDENTITY_LOANS_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
       IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
       LOANS_RESERVATIONS_SERVICE_TOKEN: ${LOANS_RESERVATIONS_SERVICE_TOKEN}
+      LOANS_EVIDENCE_SERVICE_TOKEN: ${LOANS_EVIDENCE_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      EVIDENCE_SERVICE_BASE_URL: http://evidence:8000
+      EVIDENCE_LOAN_EVIDENCE_URI_TEMPLATE: /api/v1/prestamos/{id}/evidencias
+      EVIDENCE_LOANS_SERVICE_TOKEN: ${EVIDENCE_LOANS_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      EVIDENCE_COORDINATE_CLOSURE: "true"
+      LENDUP_EXTENSIONS_COORDINATED: "true"
+      LENDUP_CANCELLATIONS_RECOVERY: "true"
+      LENDUP_GUARANTEES_DEFERRED: "true"
       OVERDUE_CHECK_DELAY_MS: 2000
       SPRINGDOC_ENABLED: "true"
       SWAGGER_PUBLIC: "true"
@@ -225,6 +236,8 @@ services:
       IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
       LENDUP_COMMISSION_PERCENT: ${LENDUP_COMMISSION_PERCENT:-18}
       MERCADOPAGO_MODE: simulado
+      LENDUP_EXTENSIONS_COORDINATED: "true"
+      LENDUP_GUARANTEES_DEFERRED: "true"
       MERCADOPAGO_SIMULATOR_BASE_URL: http://localhost:8082
       MERCADOPAGO_WEBHOOK_SECRET: ${MERCADOPAGO_WEBHOOK_SECRET}
       SPRINGDOC_ENABLED: "true"
@@ -252,6 +265,44 @@ services:
       SWAGGER_PUBLIC: "true"
     ports: ["127.0.0.1:8083:8083"]
 
+  evidence-migrate:
+    build: { context: ../lendup-evidence-service }
+    image: lendup-tf-e2e-evidence
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      DATABASE_URL: &evidence-db mysql+pymysql://lendup_evidencias:${EVIDENCE_DB_PASSWORD:?Ejecuta node scripts/setup.mjs}@mysql:3306/lendup_evidencias?charset=utf8mb4
+    depends_on: { schemas: { condition: service_completed_successfully } }
+  evidence:
+    <<: *hardened
+    image: lendup-tf-e2e-evidence
+    command: ["python", "/e2e/evidence_providers.py"]
+    volumes: ["./.generated/firebase-local.json:/run/secrets/firebase.json:ro", "./stubs/evidence_providers.py:/e2e/evidence_providers.py:ro"]
+    environment:
+      <<: *firebase-env
+      PYTHONPATH: /app
+      DATABASE_URL: *evidence-db
+      IDENTITY_SERVICE_URL: http://identity:8081
+      IDENTITY_SERVICE_TOKEN: ${IDENTITY_EVIDENCE_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      LOANS_SERVICE_URL: http://loans:8087
+      LOANS_SERVICE_TOKEN: ${LOANS_EVIDENCE_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      EVIDENCE_LOANS_SERVICE_TOKEN: ${EVIDENCE_LOANS_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      OUTBOX_PUBLISHER_ENABLED: "true"
+      RESERVATIONS_SERVICE_URL: http://reservations:8081
+      RESERVATIONS_SERVICE_TOKEN: ${RESERVATIONS_EVIDENCE_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      LOAN_CONSUMER_ENABLED: "true"
+      RABBITMQ_URL: amqp://lendup:${RABBITMQ_PASSWORD}@rabbitmq:5672/%2F
+      RABBITMQ_EXCHANGE: lendup.domain.events
+    depends_on:
+      <<: *app-deps
+      evidence-migrate: { condition: service_completed_successfully }
+      identity: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "from urllib.request import urlopen; urlopen('http://127.0.0.1:8000/health', timeout=2).close()"]
+      interval: 5s
+      timeout: 4s
+      retries: 20
+    ports: ["127.0.0.1:8088:8000"]
+
   gateway:
     restart: unless-stopped
     build: { context: ../lendup-api-gateway }
@@ -266,6 +317,7 @@ services:
       PAYMENTS_SERVICE_URL: http://payments:8082
       NOTIFICATIONS_SERVICE_URL: http://notifications:8083
       REPUTATION_SERVICE_URL: http://reputation:8082
+      EVIDENCE_SERVICE_URL: http://evidence:8000
     ports: ["127.0.0.1:8090:8090"]
     depends_on: { monolito: { condition: service_healthy } }
 
