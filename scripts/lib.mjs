@@ -43,7 +43,9 @@ async function firebase(path, body, admin = false) {
 /** Crea la cuenta en el emulador oficial; verified=false sirve para probar el rechazo de correos sin verificar. */
 export async function firebaseAccount(uid, verified = true) {
   await firebase(`/projects/${PROJECT}/accounts`, { localId: uid, email: emailOf(uid), password: env.E2E_USER_PASSWORD, emailVerified: verified }, true);
-  await firebase(`/projects/${PROJECT}/accounts:update`, { localId: uid, emailVerified: verified }, true);
+  const updated = await firebase(`/projects/${PROJECT}/accounts:update`, { localId: uid, password: env.E2E_USER_PASSWORD, emailVerified: verified }, true);
+  if (updated.status !== 200) throw new Error(`El emulador no preparó la cuenta de prueba ${uid}: HTTP ${updated.status}`);
+  tokens.delete(uid);
 }
 export async function token(uid) {
   if (!tokens.has(uid)) {
@@ -78,7 +80,7 @@ export async function rabbit(method, path, body) {
   const r = await fetch(RABBIT + path, { method, headers: { Authorization: rabbitAuth, 'Content-Type': 'application/json' }, body: body ? JSON.stringify(body) : undefined });
   const t = await r.text(); return t ? JSON.parse(t) : {};
 }
-/** Publica un evento de un productor que todavía no existe (solo Evidencias). Devuelve si alguna cola lo recibió. */
+/** Publica un evento del productor simulado de Evidencias. Devuelve si alguna cola lo recibió. */
 export async function publish(routingKey, eventType, aggregateId, payload) {
   const envelope = { event_id: crypto.randomUUID(), event_type: eventType, event_version: 1, aggregate_version: 1, aggregate_id: aggregateId, occurred_at: new Date().toISOString(), correlation_id: 'e2e-evidencias', payload };
   return (await rabbit('POST', '/exchanges/%2F/lendup.domain.events/publish', { routing_key: routingKey, payload: JSON.stringify(envelope), payload_encoding: 'string', properties: { content_type: 'application/json', delivery_mode: 2 } })).routed;

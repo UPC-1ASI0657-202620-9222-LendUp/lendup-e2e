@@ -98,6 +98,7 @@ services:
       IDENTITY_RESERVATIONS_SERVICE_TOKEN: ${IDENTITY_RESERVATIONS_SERVICE_TOKEN}
       IDENTITY_PAYMENTS_SERVICE_TOKEN: ${IDENTITY_PAYMENTS_SERVICE_TOKEN}
       IDENTITY_NOTIFICATIONS_SERVICE_TOKEN: ${IDENTITY_NOTIFICATIONS_SERVICE_TOKEN}
+      IDENTITY_LOANS_SERVICE_TOKEN: ${IDENTITY_LOANS_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
     depends_on: { schemas: { condition: service_completed_successfully } }
   identity:
     <<: *app
@@ -204,7 +205,8 @@ services:
       DB_URL: jdbc:mysql://mysql:3306/lendup_prestamos?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC
       DB_USERNAME: lendup_prestamos
       DB_PASSWORD: ${DB_PASSWORD}
-      IDENTITY_FIREBASE_USER_URI_TEMPLATE: /api/v1/estudiantes/me
+      IDENTITY_SERVICE_TOKEN: ${IDENTITY_LOANS_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
+      IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
       LOANS_RESERVATIONS_SERVICE_TOKEN: ${LOANS_RESERVATIONS_SERVICE_TOKEN}
       OVERDUE_CHECK_DELAY_MS: 2000
       SPRINGDOC_ENABLED: "true"

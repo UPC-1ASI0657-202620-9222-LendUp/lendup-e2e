@@ -1,5 +1,5 @@
 // Prueba de punta a punta de todo LendUp por el API Gateway, con los servicios reales. Los eventos nacen de las peticiones
-// HTTP; solo los de Evidencias se publican a mano, porque su microservicio todavía no existe.
+// HTTP; los de Evidencias se publican a mano porque la suite aún usa el stub.
 // Deja un reporte en reportes/e2e.md.   Uso: node scripts/e2e.mjs
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -80,6 +80,26 @@ async function identidadYCatalogo() {
     expect(`Identidad: ${uid} registrado y con correo verificado`, me, 200, (b) => b.usuario.estado_verificacion === 'VERIFICADO');
     if (uid === LENDER) expect('Identidad: entrega los términos vigentes', doc, 200, (b) => !!b.version_terminos);
   }
+  const internal = 'http://localhost:8085/internal/v1/identidad';
+  const uidRoute = `/firebase/${encodeURIComponent(BORROWER)}`;
+  const serviceToken = env.IDENTITY_LOANS_SERVICE_TOKEN;
+  if (!serviceToken || serviceToken.length < 32) throw new Error('Ejecuta node scripts/setup.mjs para configurar la credencial de Préstamos');
+  const loansConfig = (name) => compose('exec', '-T', 'loans', 'printenv', name).trim();
+  const usesServiceCredential =
+    loansConfig('IDENTITY_SERVICE_BASE_URL') === 'http://identity:8081' &&
+    loansConfig('IDENTITY_FIREBASE_USER_URI_TEMPLATE') === '/internal/v1/identidad/firebase/{uid}' &&
+    loansConfig('IDENTITY_SERVICE_TOKEN') === serviceToken;
+  check('Préstamos: el contenedor usa la ruta interna y su credencial exclusiva', usesServiceCredential);
+  const loansCredential = 'raw:' + serviceToken;
+  const resolved = await call('GET', uidRoute, loansCredential, undefined, internal);
+  check('Identidad: credencial de Préstamos resuelve solo usuario_id', resolved.status === 200 &&
+    resolved.body.usuario_id === ids[BORROWER] && Object.keys(resolved.body).length === 1, `HTTP ${resolved.status}`);
+  expect('Identidad: credencial interna inválida devuelve 401', await call('GET', uidRoute, 'raw:' + randomUUID(), undefined, internal), 401);
+  expect('Identidad: Firebase ID token en ruta interna devuelve 401', await call('GET', uidRoute, BORROWER, undefined, internal), 401);
+  for (const route of ['correo', 'rol', 'elegibilidad', `contacto?reserva_id=${randomUUID()}`]) {
+    const denied = await call('GET', `/usuarios/${ids[BORROWER]}/${route}`, loansCredential, undefined, internal);
+    expect(`Identidad: Préstamos no tiene permiso para ${route.split('?')[0]}`, denied, 403);
+  }
   expect('Catálogo: categorías públicas sin sesión', await call('GET', '/catalogo/categorias', null), 200, (b) => b.length >= 8);
   const publicacion = await publicar();
   expect('Catálogo: la publicación es visible', await call('GET', `/catalogo/publicaciones/${publicacion}`, null), 200, (b) => b.propietarioUsuarioId === ids[LENDER]);
@@ -105,6 +125,7 @@ async function identidadYCatalogo() {
     check(`Gateway: no publica ${ruta.split('/').slice(0, 4).join('/')}`, r.status === 404, `HTTP ${r.status}`);
   }
   const propio = await call('GET', '/prestamos', LENDER);
+  expect('Préstamos: resuelve al usuario por Identidad desde el Gateway', propio, 200, Array.isArray);
   check('Gateway: agrega X-Correlation-ID', (propio.headers.get('x-correlation-id') ?? '').length >= 8, propio.headers.get('x-correlation-id'));
 }
 
@@ -447,7 +468,7 @@ if (!failed) try {
     'prestamos.fecha-devolucion-actualizada.v1', 'prestamos.devolucion-registrada.v1', 'prestamos.vencido.v1', 'prestamos.finalizado.v1', 'prestamos.cancelado.v1', 'prestamos.cancelacion-rechazada.v1', 'prestamos.periodo-liberado.v1',
     'pagos.pago-confirmado.v1', 'pagos.pago-rechazado.v1', 'pagos.garantia-constituida.v1', 'pagos.tarifa-liberada.v1', 'pagos.garantia-devuelta.v1', 'pagos.garantia-retenida.v1', 'pagos.reembolso-procesado.v1'];
   const faltan = propias.filter((k) => !seen[k]);
-  check(`Los ${Object.values(seen).reduce((s, n) => s + n, 0)} eventos reales cumplen el esquema del productor y lo que exige cada consumidor`, incumplen.length === 0, [...new Set(incumplen)].slice(0, 4).join('; ') || 'sin diferencias');
+  check(`Los ${Object.values(seen).reduce((s, n) => s + n, 0)} eventos observados cumplen el esquema del productor y lo que exige cada consumidor`, incumplen.length === 0, [...new Set(incumplen)].slice(0, 4).join('; ') || 'sin diferencias');
   const ejemplos = revisarEjemplos();
   check(`Los ${ejemplos.total} ejemplos de los contratos cumplen su esquema`, ejemplos.errors.length === 0, ejemplos.errors.slice(0, 3).join('; ') || 'sin diferencias');
   check(`Préstamos y Pagos publicaron ${propias.length} tipos de evento distintos`, faltan.length === 0, faltan.join(', ') || 'todos');
@@ -456,7 +477,7 @@ if (!failed) try {
 mkdirSync(resolve(root, 'reportes'), { recursive: true });
 const ok = results.filter((r) => r.ok).length;
 writeFileSync(resolve(root, 'reportes', 'e2e.md'), [`# Prueba de punta a punta de LendUp`, '', `Fecha: ${new Date().toISOString()}  `, `Resultado: **${failed ? 'FALLÓ: ' + failed.message : `${ok}/${results.length} verificaciones en verde`}**`, '',
-  'Reales: Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación, API Gateway, MySQL y RabbitMQ. Firebase es el emulador oficial y Mercado Pago el modo simulado. Evidencias aún no existe: sus dos eventos se publican a mano.', '',
+  'Reales: Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación, API Gateway, MySQL y RabbitMQ. Firebase es el emulador oficial y Mercado Pago el modo simulado. Evidencias usa rutas del stub y su suite publica los eventos manualmente.', '',
   ...[...new Set(results.map((r) => r.story))].flatMap((s) => [`## ${s}`, '', '| Verificación | Resultado | Detalle |', '|---|---|---|', ...results.filter((r) => r.story === s).map((r) => `| ${r.name} | ${r.ok ? 'OK' : 'FALLA'} | ${r.detail.replaceAll('|', '/')} |`), '']),
   '## Eventos que pasaron por RabbitMQ', '', '| Routing key | Cantidad |', '|---|---|', ...Object.entries(seen).sort().map(([k, n]) => `| \`${k}\` | ${n} |`), '',
   '## Colas', '', '| Cola | Mensajes pendientes |', '|---|---|', ...queues.map((q) => `| \`${q.name}\` | ${q.messages ?? 0} |`), ''].join('\n'));

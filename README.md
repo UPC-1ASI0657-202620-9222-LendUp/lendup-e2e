@@ -28,6 +28,8 @@ node scripts/configurar.mjs
 
 `setup.mjs` crea `.env` con contraseñas aleatorias y una cuenta de Firebase falsa. `configurar.mjs` crea el `.env` de Pagos, Notificaciones, Préstamos y el gateway para correr cada uno por separado. Ninguno sobrescribe lo que ya exista.
 
+El Compose integrado usa `IDENTITY_LOANS_SERVICE_TOKEN` para enlazar Préstamos con la ruta privada de resolución de Firebase UID. En entornos existentes, volver a ejecutar `node scripts/setup.mjs` para agregar el secreto si falta y recrear los contenedores de Identidad y Préstamos con la versión de Identidad que reconoce ese permiso. La suite comprueba que el contenedor de Préstamos utiliza la credencial configurada y verifica por HTTP los estados 200, 401 y 403 sin registrar su valor.
+
 ## Todo junto
 
 ```powershell
