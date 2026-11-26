@@ -24,13 +24,13 @@ const notifFor = (key) => {
   if (key === 'reservas.confirmada.v1') return notif.reservaConfirmada;
   if (key === 'reservas.cancelada.v1') return notif.reservaCancelada;
   if (key.startsWith('pagos.')) return notif.pagos;
-  if (/^prestamos\.(extension|reprogramacion|fecha-devolucion)/.test(key)) return notif.cambioDeFecha;
-  if (/^prestamos\.(objeto-entregado|activado|devolucion-registrada|vencido|finalizado|cancelacion-rechazada)/.test(key)) return notif.prestamo;
+  if (/^prestamos\.(extension-(solicitada|aceptada|rechazada)|reprogramacion|fecha-devolucion)/.test(key)) return notif.cambioDeFecha;
+  if (/^prestamos\.(objeto-entregado|activado|devolucion-registrada|vencido|finalizado|cancelacion-rechazada|recuperacion-pendiente)/.test(key)) return notif.prestamo;
   if (key.startsWith('evidencias.')) return notif.incidencia;
   if (key.startsWith('reputation.')) return notif.calificacionRegistrada;
   return null;
 };
-const PAY_KEYS = /^(reservas\.(confirmada|cancelada)|prestamos\.(creado|activado|devolucion-registrada|finalizado|extension-aceptada)|evidencias\.)/;
+const PAY_KEYS = /^(reservas\.(confirmada|cancelada|extension-retencion-rechazada)|prestamos\.(creado|activado|devolucion-registrada|finalizado|extension-aceptada|fecha-devolucion-actualizada)|evidencias\.)/;
 
 /** Devuelve la lista de incumplimientos de un mensaje. */
 export function revisar(key, message) {

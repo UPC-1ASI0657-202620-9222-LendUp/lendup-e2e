@@ -32,6 +32,8 @@ El Compose integrado usa `IDENTITY_LOANS_SERVICE_TOKEN` para enlazar Préstamos 
 
 ## Todo junto
 
+La rama coordinada conserva el resultado previo de 227 comprobaciones como línea base. Construye Préstamos, Reservas, Pagos y Notificaciones desde sus ramas compatibles. Usa `compose.yaml` para esta verificación. El override `compose.loan-period.yaml` del entorno anterior apunta a una imagen previa a V5. `scripts/e2e.mjs` genera `reportes/e2e-coordinado.md`. Mercado Pago es simulado y Evidencias solo interviene mediante fixtures de incidencia.
+
 ```powershell
 docker compose up -d --build
 node scripts/e2e.mjs

@@ -163,6 +163,8 @@ services:
       LOAN_SERVICE_BASE_URL: http://loans:8087
       LOAN_SERVICE_TOKEN: ${LOANS_RESERVATIONS_SERVICE_TOKEN}
       LOAN_CONTACT_ACCESS_URI_TEMPLATE: /internal/v1/prestamos/reservas/{reserva_id}/participantes/{usuario_id}/contacto
+      LENDUP_EXTENSIONS_HOLD_SECONDS: "35"
+      LENDUP_CANCELLATIONS_RECOVERY: "true"
     ports: ["127.0.0.1:8081:8081"]
   reputation-migrate:
     build: { context: ../lendup-reputation-service }
@@ -208,6 +210,9 @@ services:
       IDENTITY_SERVICE_TOKEN: ${IDENTITY_LOANS_SERVICE_TOKEN:?Ejecuta node scripts/setup.mjs}
       IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
       LOANS_RESERVATIONS_SERVICE_TOKEN: ${LOANS_RESERVATIONS_SERVICE_TOKEN}
+      LENDUP_EXTENSIONS_COORDINATED: "true"
+      LENDUP_CANCELLATIONS_RECOVERY: "true"
+      LENDUP_GUARANTEES_DEFERRED: "true"
       OVERDUE_CHECK_DELAY_MS: 2000
       SPRINGDOC_ENABLED: "true"
       SWAGGER_PUBLIC: "true"
@@ -225,6 +230,8 @@ services:
       IDENTITY_FIREBASE_USER_URI_TEMPLATE: /internal/v1/identidad/firebase/{uid}
       LENDUP_COMMISSION_PERCENT: ${LENDUP_COMMISSION_PERCENT:-18}
       MERCADOPAGO_MODE: simulado
+      LENDUP_EXTENSIONS_COORDINATED: "true"
+      LENDUP_GUARANTEES_DEFERRED: "true"
       MERCADOPAGO_SIMULATOR_BASE_URL: http://localhost:8082
       MERCADOPAGO_WEBHOOK_SECRET: ${MERCADOPAGO_WEBHOOK_SECRET}
       SPRINGDOC_ENABLED: "true"

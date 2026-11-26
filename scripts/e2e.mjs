@@ -1,6 +1,6 @@
 // Prueba de punta a punta de todo LendUp por el API Gateway, con los servicios reales. Los eventos nacen de las peticiones
 // HTTP; los de Evidencias se publican a mano porque la suite aún usa el stub.
-// Deja un reporte en reportes/e2e.md.   Uso: node scripts/e2e.mjs
+// Deja un reporte en reportes/e2e-coordinado.md. Uso: node scripts/e2e.mjs
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
@@ -147,7 +147,7 @@ async function solicitudes() {
 
 async function cicloCompleto() {
   historia('3. Ciclo completo con extensión pagada y calificaciones');
-  const { reserva, prestamo } = await reservar(Date.now() - HOUR, Date.now() + 47 * HOUR);
+  const { reserva, prestamo, publicacion } = await reservar(Date.now() - HOUR, Date.now() + 47 * HOUR);
   expect('Préstamos: sin pagar no se puede entregar', await call('POST', `/prestamos/${prestamo}/entrega`, LENDER), 409);
   expect('Reputación: no se califica un préstamo sin finalizar', await call('POST', `/prestamos/${prestamo}/calificaciones`, BORROWER, { puntaje: 5 }), 404);
   const desglose = await until('que Pagos conozca el préstamo', async () => { const r = await call('GET', `/prestamos/${prestamo}/desglose-pago`, BORROWER); return r.status === 200 && r; });
@@ -174,9 +174,16 @@ async function cicloCompleto() {
   const ext = await call('POST', `/prestamos/${prestamo}/extensiones`, BORROWER, { fecha_propuesta_en: nueva, costo_adicional: 40, moneda: 'PEN' });
   expect('Préstamos: extensión solicitada', ext, 201, (b) => b.estado === 'PENDIENTE');
   await aviso(LENDER, 'Extensión solicitada', 'el prestamista', (n) => n.origen_id === ext.body.id);
-  expect('Préstamos: el prestamista la acepta', await call('POST', `/prestamos/${prestamo}/extensiones/${ext.body.id}/respuesta`, LENDER, { estado: 'ACEPTADA_PENDIENTE_PAGO' }), 200);
+  const cargoExtension = { prestamo_id: prestamo, cambio_fecha_prestamo_id: ext.body.id, tipo: 'PAGO_EXTENSION', monto: 40, medio_pago_seleccionado: 'MERCADO_PAGO', clave_idempotencia: `ext-${ext.body.id}` };
+  expect('Pagos: no hay checkout antes de retener', await call('POST', '/pagos', BORROWER, cargoExtension), 409);
+  expect('Préstamos: aceptación espera primero la retención', await call('POST', `/prestamos/${prestamo}/extensiones/${ext.body.id}/respuesta`, LENDER, { estado: 'ACEPTADA_PENDIENTE_PAGO' }), 200, (b) => b.estado === 'ACEPTADA_PENDIENTE_RETENCION');
   await aviso(BORROWER, 'Extensión aceptada', 'el prestatario', (n) => n.origen_id === ext.body.id);
-  await pagar('/pagos', { prestamo_id: prestamo, cambio_fecha_prestamo_id: ext.body.id, tipo: 'PAGO_EXTENSION', monto: 40, medio_pago_seleccionado: 'MERCADO_PAGO', clave_idempotencia: `ext-${ext.body.id}` }, 'extensión');
+  const finActual = new Date(antes.devolucion_vigente_en + '-05:00').getTime();
+  const rival = await solicitar(finActual + HOUR, finActual + 2 * HOUR, publicacion);
+  expect('Reservas: solicitud sobre una retención aún no es confirmación', rival, 201);
+  expect('Reservas: una retención vigente impide aceptar una reserva superpuesta', await call('POST', `/solicitudes/${rival.body.id}/aceptacion`, LENDER), 409);
+  check('Préstamos: la retención no altera la fecha vigente', (await loan(prestamo)).devolucion_vigente_en === antes.devolucion_vigente_en);
+  await pagar('/pagos', cargoExtension, 'extensión');
   const extendido = await until('que Préstamos aplique la extensión', async () => { const l = await loan(prestamo); return l.devolucion_vigente_en === nueva && l; });
   check('Préstamos: nueva fecha vigente y conserva la original', extendido.devolucion_original_en === antes.devolucion_original_en && extendido.cambios_fecha[0].estado === 'APLICADA', extendido.devolucion_vigente_en);
   const reservaExtendida = await until(
@@ -244,14 +251,36 @@ async function cancelacion() {
 }
 
 async function cancelacionRechazada() {
-  historia('5. Cancelación rechazada porque ya se entregó');
+  historia('5. Cancelación según la recepción');
+  const recuperacion = await reservar(Date.now() - HOUR, Date.now() + 23 * HOUR);
+  await pagarTodo(recuperacion.prestamo, 20);
+  expect('Préstamos: entrega registrada sin recepción', await call('POST', `/prestamos/${recuperacion.prestamo}/entrega`, LENDER), 200);
+  expect('Reservas: admite solicitud con entrega registrada', await call('POST', `/reservas/${recuperacion.reserva}/cancelacion`, BORROWER, { motivo_cancelacion: 'Recuperar el objeto' }), 200);
+  await until('que se espere recuperación', async () => (await loan(recuperacion.prestamo)).estado_detalle === 'RECUPERACION_PENDIENTE');
+  await aviso(LENDER, 'Recuperación pendiente', 'el prestamista', (n) => n.origen_id === recuperacion.prestamo);
+  check('Reservas: no libera ocupación mientras falta recuperación', (await call('GET', '/reservas', BORROWER)).body.some((r) => r.id === recuperacion.reserva && r.estado === 'CANCELACION_PENDIENTE'));
+  const tramoEnCustodia = [Date.now() + 2 * HOUR, Date.now() + 5 * HOUR, recuperacion.publicacion];
+  expect('Reservas: la custodia pendiente impide solicitar el tramo ocupado', await solicitar(...tramoEnCustodia), 409);
+  const tramoPosterior = [Date.now() + 25 * HOUR, Date.now() + 30 * HOUR, recuperacion.publicacion];
+  expect('Reservas: la custodia supera el fin contractual si falta recuperación', await solicitar(...tramoPosterior), 409);
+  check('Pagos: antes de recuperar no hay reembolsos', !(await transacciones(recuperacion.prestamo)).some((t) => ['REEMBOLSO_TARIFA', 'DEVOLUCION_GARANTIA'].includes(t.tipo)));
+  expect('Préstamos: prestatario no confirma recuperación', await call('POST', `/prestamos/${recuperacion.prestamo}/confirmacion-recuperacion`, BORROWER), 403);
+  expect('Préstamos: no admite recepción mientras recupera', await call('POST', `/prestamos/${recuperacion.prestamo}/recepcion`, BORROWER), 409);
+  expect('Préstamos: el prestamista confirma recuperación', await call('POST', `/prestamos/${recuperacion.prestamo}/confirmacion-recuperacion`, LENDER), 200, (b) => b.estado === 'CANCELADO');
+  expect('Préstamos: confirmación de recuperación repetida es idempotente', await call('POST', `/prestamos/${recuperacion.prestamo}/confirmacion-recuperacion`, LENDER), 200, (b) => b.estado === 'CANCELADO');
+  await until('que Reservas confirme cancelación por recuperación', async () => (await call('GET', '/reservas', BORROWER)).body.some((r) => r.id === recuperacion.reserva && r.estado === 'CANCELADA'));
+  await reservar(...tramoEnCustodia);
+  check('Reservas: puede volver a ocupar el tramo tras confirmar recuperación', true);
+  await transaccion(recuperacion.prestamo, 'REEMBOLSO_TARIFA');
+  await transaccion(recuperacion.prestamo, 'DEVOLUCION_GARANTIA');
+  check('Pagos: reembolsa tarifa y garantía una vez después de recuperar', (await transacciones(recuperacion.prestamo)).filter((t) => ['REEMBOLSO_TARIFA', 'DEVOLUCION_GARANTIA'].includes(t.tipo)).length === 2);
   const { reserva, prestamo } = await reservar(Date.now() - HOUR, Date.now() + 23 * HOUR);
   await pagarTodo(prestamo, 20);
-  expect('Préstamos: entrega registrada', await call('POST', `/prestamos/${prestamo}/entrega`, LENDER), 200);
+  await entregarYRecibir(prestamo);
   expect('Reservas: cancelación solicitada', await call('POST', `/reservas/${reserva}/cancelacion`, BORROWER, { motivo_cancelacion: 'Cambio de planes' }), 200);
   await until('que Reservas vuelva a CONFIRMADA', async () => (await call('GET', '/reservas', BORROWER)).body.find?.((x) => x.id === reserva && x.estado === 'CONFIRMADA'));
   check('Reservas: volvió a CONFIRMADA (prestamos.cancelacion-rechazada.v1)', true);
-  check('Préstamos: sigue su curso', (await loan(prestamo)).estado === 'ENTREGA_REGISTRADA', 'ENTREGA_REGISTRADA');
+  check('Préstamos: la recepción confirmada impide cancelar', (await loan(prestamo)).estado === 'ACTIVO', 'ACTIVO');
   await aviso(BORROWER, 'Cancelación no aceptada', 'el prestatario', (n) => n.origen_id === prestamo);
 }
 
@@ -330,6 +359,34 @@ async function vencimiento() {
   check('Pagos: devolvió la garantía', true);
 }
 
+async function retencionExpirada() {
+  historia('Extensión: expiración y compensación de pago tardío');
+  const { reserva, prestamo, publicacion } = await activo(Date.now() - HOUR, Date.now() + 23 * HOUR, 20);
+  const original = (await loan(prestamo)).devolucion_vigente_en;
+  const ext = await call('POST', `/prestamos/${prestamo}/extensiones`, BORROWER, { fecha_propuesta_en: masHoras(original, 24) });
+  expect('Extensión tardía: se propone el cambio', ext, 201);
+  expect('Extensión tardía: se solicita retención',
+    await call('POST', `/prestamos/${prestamo}/extensiones/${ext.body.id}/respuesta`, LENDER, { estado: 'ACEPTADA_PENDIENTE_PAGO' }), 200);
+  const cargo = { ...tarifaBody(prestamo, 20, `ext-${ext.body.id}`), tipo: 'PAGO_EXTENSION', cambio_fecha_prestamo_id: ext.body.id };
+  const cobro = await cobrar('/pagos', cargo, 'extensión que expira');
+  await until('que expire la retención', async () => (await loan(prestamo)).cambios_fecha.some((c) => c.id === ext.body.id && c.estado === 'RECHAZADA'), 65);
+  expect('Pagos: no vuelve a entregar un checkout expirado', await call('POST', '/pagos', BORROWER, cargo), 409);
+  const fin = new Date(original + '-05:00').getTime();
+  const rival = await solicitar(fin + HOUR, fin + 2 * HOUR, publicacion);
+  expect('Reservas: el tramo expirado es elegible para nueva solicitud', rival, 201);
+  expect('Reservas: otro préstamo ocupa el tramo al vencer la retención', await call('POST', `/solicitudes/${rival.body.id}/aceptacion`, LENDER), 201);
+  await simulador(cobro.checkout_url, 'aprobado');
+  await simulador(cobro.checkout_url, 'aprobado');
+  const refunds = await until('compensación de los dos cargos de prueba distintos', async () => {
+    const rows = (await transacciones(prestamo)).filter((t) => t.tipo === 'REEMBOLSO_TARIFA' && t.estado === 'CONFIRMADA');
+    return rows.length === 2 && rows;
+  });
+  check('Pagos: compensa una vez cada cargo tardío distinto', refunds.every((t) => t.monto === 20));
+  const ocupacion = (await call('GET', '/reservas', BORROWER)).body.find((r) => r.id === reserva);
+  check('Préstamos y Reservas: el pago tardío no aplica la nueva fecha',
+    ocupacion.ocupacion_hasta === original && (await loan(prestamo)).devolucion_vigente_en === original);
+}
+
 async function incidencias() {
   historia('8. Incidencia con afectación parcial (Evidencias simulada: publica sus eventos según el contrato)');
   const { prestamo } = await activo(Date.now() - HOUR, Date.now() + 23 * HOUR, 20);
@@ -342,13 +399,49 @@ async function incidencias() {
   await until('que Pagos retenga la garantía', async () => sql('lendup_pagos', `select estado from lendup_pagos.garantias where prestamo_id=uuid_to_bin('${prestamo}')`).out === 'RETENIDA_POR_INCIDENCIA');
   check('Pagos: la garantía queda RETENIDA_POR_INCIDENCIA (RF41)', true);
   await aviso(BORROWER, 'Incidencia reportada', 'el prestatario', (n) => n.origen_id === incidencia);
+  const adelantada = randomUUID();
+  const otra = { ...payload, incidencia_id: adelantada };
+  check('Contrato simulado: resolución sin afectación llega antes de su reporte', await publish(
+    'evidencias.incidencia-resuelta.v1', 'IncidenciaResuelta', adelantada,
+    { ...otra, decision_garantia: 'SIN_AFECTACION', monto_garantia_afectado: 0, moneda: 'PEN' }));
+  await publish('evidencias.incidencia-reportada.v1', 'IncidenciaReportada', adelantada, otra);
+  await publish('evidencias.incidencia-reportada.v1', 'IncidenciaReportada', incidencia, payload);
+  await until('que Pagos proyecte la resolución adelantada', async () => sql('lendup_pagos',
+    `select decision from lendup_pagos.guarantee_incident_projection where incident_id='${adelantada}'`).out === 'SIN_AFECTACION');
+  await until('que Préstamos proyecte la resolución adelantada', async () => sql('lendup_prestamos',
+    `select resolved from lendup_prestamos.loan_incident_projection where incident_id='${adelantada}'`).out === '1');
+  expect('Préstamos: una resolución adelantada no cierra otra incidencia', await call('POST', `/prestamos/${prestamo}/confirmacion-devolucion`, LENDER), 409);
   check('Broker: evidencias.incidencia-resuelta.v1 tiene suscriptores', await publish('evidencias.incidencia-resuelta.v1', 'IncidenciaResuelta', incidencia, { ...payload, decision_garantia: 'AFECTACION_PARCIAL', monto_garantia_afectado: 20, moneda: 'PEN', justificacion_resolucion: 'Daño leve comprobado.' }));
-  const tx = await transaccion(prestamo, 'RETENCION_GARANTIA'), dev = await transaccion(prestamo, 'DEVOLUCION_GARANTIA');
-  check('Pagos: retuvo 20 y devolvió 30', tx.monto === 20 && dev.monto === 30, `${tx.monto} / ${dev.monto}`);
+  const tx = await transaccion(prestamo, 'RETENCION_GARANTIA');
+  check('Pagos: retiene 20 sin devolver saldo antes de confirmación', tx.monto === 20 &&
+    !(await transacciones(prestamo)).some((t) => t.tipo === 'DEVOLUCION_GARANTIA'));
   await aviso(LENDER, 'Incidencia resuelta', 'el prestamista', (n) => n.origen_id === incidencia && n.mensaje === 'Daño leve comprobado.');
   await aviso(LENDER, 'Garantía retenida', 'el prestamista');
   await until('que Préstamos libere el cierre', async () => (await loan(prestamo)).estado_detalle === 'DEVOLUCION_REGISTRADA');
   expect('Préstamos: resuelta la incidencia, se puede finalizar', await call('POST', `/prestamos/${prestamo}/confirmacion-devolucion`, LENDER), 200, (b) => b.estado === 'FINALIZADO');
+  const dev = await transaccion(prestamo, 'DEVOLUCION_GARANTIA');
+  check('Pagos: devuelve exactamente 30 una vez tras el cierre', dev.monto === 30 &&
+    (await transacciones(prestamo)).filter((t) => t.tipo === 'DEVOLUCION_GARANTIA').length === 1);
+  await aviso(BORROWER, 'Garantía devuelta', 'el prestatario', (n) => fecha(n) >= started && n.mensaje.includes('30'));
+}
+
+async function incidenciaConRetencionTotal() {
+  historia('Garantía: afectación total autorizada (Evidencias simulada)');
+  const { prestamo } = await activo(Date.now() - HOUR, Date.now() + 23 * HOUR, 20);
+  expect('Garantía total: se registra el objeto devuelto', await call('POST', `/prestamos/${prestamo}/devolucion`, BORROWER), 200);
+  const id = randomUUID();
+  const payload = { incidencia_id: id, prestamo_id: prestamo, prestatario_usuario_id: ids[BORROWER], prestamista_usuario_id: ids[LENDER] };
+  await publish('evidencias.incidencia-reportada.v1', 'IncidenciaReportada', id, payload);
+  await until('que Préstamos proyecte la incidencia total', async () => (await loan(prestamo)).estado_detalle === 'PENDIENTE_INCIDENCIA');
+  await publish('evidencias.incidencia-resuelta.v1', 'IncidenciaResuelta', id,
+    { ...payload, decision_garantia: 'AFECTACION_TOTAL', monto_garantia_afectado: 50, moneda: 'PEN' });
+  const aplicada = await transaccion(prestamo, 'RETENCION_GARANTIA');
+  check('Pagos: registra retención total de los 50 autorizados', aplicada.monto === 50);
+  await until('que Préstamos permita el cierre tras afectación total', async () => (await loan(prestamo)).estado_detalle === 'DEVOLUCION_REGISTRADA');
+  expect('Garantía total: el prestamista confirma la devolución', await call('POST', `/prestamos/${prestamo}/confirmacion-devolucion`, LENDER), 200);
+  await until('que Pagos procese el cierre con saldo cero', async () => sql('lendup_pagos',
+    `select count(*) from lendup_pagos.guarantee_closures where loan_id='${prestamo}'`).out === '1');
+  check('Pagos: saldo cero tras el cierre sin devolución adicional', !(await transacciones(prestamo)).some((t) => t.tipo === 'DEVOLUCION_GARANTIA'));
 }
 
 const listo = (puerto) => fetch(`http://localhost:${puerto}/actuator/health/readiness`).then((r) => r.ok).catch(() => false);
@@ -449,7 +542,7 @@ try {
   await rabbit('POST', `/bindings/%2F/e/lendup.domain.events/q/${SPY}`, { routing_key: '#' });
   await rabbit('DELETE', `/queues/%2F/${SPY}/contents`);
   deadBefore = await deadLetters();
-  for (const s of [identidadYCatalogo, solicitudes, cicloCompleto, cancelacion, cancelacionRechazada, cambiosDeFecha, vencimiento, incidencias, resiliencia, independenciaDeDatos, rutasDelFrontend, outboxes]) await s();
+  for (const s of [identidadYCatalogo, solicitudes, cicloCompleto, cancelacion, cancelacionRechazada, cambiosDeFecha, vencimiento, retencionExpirada, incidencias, incidenciaConRetencionTotal, resiliencia, independenciaDeDatos, rutasDelFrontend, outboxes]) await s();
 } catch (e) { failed = e; console.error('\n' + e.message); }
 
 historia('13. Broker');
@@ -468,18 +561,23 @@ if (!failed) try {
     'prestamos.fecha-devolucion-actualizada.v1', 'prestamos.devolucion-registrada.v1', 'prestamos.vencido.v1', 'prestamos.finalizado.v1', 'prestamos.cancelado.v1', 'prestamos.cancelacion-rechazada.v1', 'prestamos.periodo-liberado.v1',
     'pagos.pago-confirmado.v1', 'pagos.pago-rechazado.v1', 'pagos.garantia-constituida.v1', 'pagos.tarifa-liberada.v1', 'pagos.garantia-devuelta.v1', 'pagos.garantia-retenida.v1', 'pagos.reembolso-procesado.v1'];
   const faltan = propias.filter((k) => !seen[k]);
+  const coordinadas = ['prestamos.extension-retencion-solicitada.v1', 'prestamos.extension-confirmacion-solicitada.v1',
+    'reservas.extension-retenida.v1', 'reservas.extension-ocupacion-confirmada.v1',
+    'reservas.extension-retencion-rechazada.v1', 'prestamos.recuperacion-pendiente.v1'];
+  const coordinadasFaltantes = coordinadas.filter((k) => !seen[k]);
   check(`Los ${Object.values(seen).reduce((s, n) => s + n, 0)} eventos observados cumplen el esquema del productor y lo que exige cada consumidor`, incumplen.length === 0, [...new Set(incumplen)].slice(0, 4).join('; ') || 'sin diferencias');
   const ejemplos = revisarEjemplos();
   check(`Los ${ejemplos.total} ejemplos de los contratos cumplen su esquema`, ejemplos.errors.length === 0, ejemplos.errors.slice(0, 3).join('; ') || 'sin diferencias');
   check(`Préstamos y Pagos publicaron ${propias.length} tipos de evento distintos`, faltan.length === 0, faltan.join(', ') || 'todos');
+  check(`Se observaron ${coordinadas.length} tipos de evento de la coordinación`, coordinadasFaltantes.length === 0, coordinadasFaltantes.join(', ') || 'todos');
 } catch (e) { failed = e; }
 
 mkdirSync(resolve(root, 'reportes'), { recursive: true });
 const ok = results.filter((r) => r.ok).length;
-writeFileSync(resolve(root, 'reportes', 'e2e.md'), [`# Prueba de punta a punta de LendUp`, '', `Fecha: ${new Date().toISOString()}  `, `Resultado: **${failed ? 'FALLÓ: ' + failed.message : `${ok}/${results.length} verificaciones en verde`}**`, '',
+writeFileSync(resolve(root, 'reportes', 'e2e-coordinado.md'), [`# Prueba de punta a punta de LendUp`, '', `Fecha: ${new Date().toISOString()}  `, `Resultado: **${failed ? 'FALLÓ: ' + failed.message : `${ok}/${results.length} verificaciones en verde`}**`, '',
   'Reales: Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación, API Gateway, MySQL y RabbitMQ. Firebase es el emulador oficial y Mercado Pago el modo simulado. Evidencias usa rutas del stub y su suite publica los eventos manualmente.', '',
   ...[...new Set(results.map((r) => r.story))].flatMap((s) => [`## ${s}`, '', '| Verificación | Resultado | Detalle |', '|---|---|---|', ...results.filter((r) => r.story === s).map((r) => `| ${r.name} | ${r.ok ? 'OK' : 'FALLA'} | ${r.detail.replaceAll('|', '/')} |`), '']),
   '## Eventos que pasaron por RabbitMQ', '', '| Routing key | Cantidad |', '|---|---|', ...Object.entries(seen).sort().map(([k, n]) => `| \`${k}\` | ${n} |`), '',
   '## Colas', '', '| Cola | Mensajes pendientes |', '|---|---|', ...queues.map((q) => `| \`${q.name}\` | ${q.messages ?? 0} |`), ''].join('\n'));
-console.log(`\n${failed ? 'FALLÓ' : 'TODO EN VERDE'}: ${ok}/${results.length} verificaciones. Reporte: ${resolve(root, 'reportes', 'e2e.md')}`);
+console.log(`\n${failed ? 'FALLÓ' : 'TODO EN VERDE'}: ${ok}/${results.length} verificaciones. Reporte: ${resolve(root, 'reportes', 'e2e-coordinado.md')}`);
 process.exit(failed ? 1 : 0);
