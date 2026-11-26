@@ -13,7 +13,8 @@ const started = new Date(Date.now() - 2000);
 async function publicar(garantia = 50) {
   const r = await call('POST', '/catalogo/publicaciones', LENDER, {
     detalles: { categoriaId: 'c0000000-0000-4000-8000-000000000002', titulo: 'Calculadora Casio', descripcion: 'Calculadora científica', condicionObjeto: 'Buen estado', universidad: 'UPC', campus: 'Monterrico', ubicacion: 'Pabellón A' },
-    condiciones: { tarifaDiaria: 20, garantiaMonetaria: garantia, moneda: 'PEN', lugarIntercambio: 'Campus Monterrico', condicionesUso: 'Uso académico', condicionesEntrega: 'Entrega personal', condicionesDevolucion: 'Mismo estado', condicionesCancelacion: 'Antes de la entrega' } });
+    condiciones: { tarifaDiaria: 20, garantiaMonetaria: garantia, moneda: 'PEN', lugarIntercambio: 'Campus Monterrico', condicionesUso: 'Uso académico', condicionesEntrega: 'Entrega personal', condicionesDevolucion: 'Mismo estado', condicionesCancelacion: 'Antes de la entrega' }
+  });
   if (r.status !== 201) throw new Error(`Catálogo no publicó: HTTP ${r.status} ${JSON.stringify(r.body)}`);
   const d = await call('POST', `/catalogo/publicaciones/${r.body.id}/disponibilidades`, LENDER, { desde: lima(Date.now() - 30 * 24 * HOUR), hasta: lima(Date.now() + 120 * 24 * HOUR) });
   if (d.status !== 201) throw new Error(`Catálogo no guardó la disponibilidad: HTTP ${d.status} ${JSON.stringify(d.body)}`);
@@ -157,6 +158,24 @@ async function cicloCompleto() {
   await pagar('/pagos', { prestamo_id: prestamo, cambio_fecha_prestamo_id: ext.body.id, tipo: 'PAGO_EXTENSION', monto: 40, medio_pago_seleccionado: 'MERCADO_PAGO', clave_idempotencia: `ext-${ext.body.id}` }, 'extensión');
   const extendido = await until('que Préstamos aplique la extensión', async () => { const l = await loan(prestamo); return l.devolucion_vigente_en === nueva && l; });
   check('Préstamos: nueva fecha vigente y conserva la original', extendido.devolucion_original_en === antes.devolucion_original_en && extendido.cambios_fecha[0].estado === 'APLICADA', extendido.devolucion_vigente_en);
+  const reservaExtendida = await until(
+  'que Reservas actualice la ocupacion por extension',
+  async () => {
+    const respuesta = await call('GET', '/reservas', BORROWER);
+
+    return respuesta.body.find?.(
+      (x) => x.id === reserva &&
+             x.ocupacion_hasta === nueva
+    );
+  }
+);
+
+check(
+  'Reservas: extension pagada actualiza ocupacion y conserva contrato',
+  reservaExtendida.ocupacion_hasta === extendido.devolucion_vigente_en &&
+  reservaExtendida.hasta === antes.devolucion_original_en,
+  reservaExtendida.ocupacion_hasta
+);
   await aviso(BORROWER, 'Nueva fecha de devolución', 'el prestatario', (n) => n.origen_id === ext.body.id);
   expect('Préstamos: devolución registrada', await call('POST', `/prestamos/${prestamo}/devolucion`, BORROWER), 200, (b) => b.estado === 'DEVOLUCION_REGISTRADA');
   await aviso(LENDER, 'Devolución registrada', 'el prestamista', (n) => n.origen_id === prestamo);
@@ -230,6 +249,34 @@ async function cambiosDeFecha() {
   await aviso(LENDER, 'Reprogramación rechazada', 'el prestamista', (n) => n.origen_id === rep.body.id);
   const rep2 = await call('POST', `/prestamos/${prestamo}/reprogramaciones`, LENDER, { fecha_propuesta_en: masHoras(base, 30) });
   expect('Préstamos: nueva propuesta aceptada sin costo', await call('POST', `/prestamos/${prestamo}/reprogramaciones/${rep2.body.id}/respuesta`, BORROWER, { estado: 'APLICADA' }), 200, (b) => b.estado === 'APLICADA');
+  const prestamoReprogramado = await until(
+  'que Prestamos aplique la reprogramacion',
+  async () => {
+    const p = await loan(prestamo);
+
+    return p.devolucion_vigente_en === masHoras(base, 30) && p;
+  }
+);
+
+const reservaReprogramada = await until(
+  'que Reservas actualice la ocupacion por reprogramacion',
+  async () => {
+    const respuesta = await call('GET', '/reservas', BORROWER);
+
+    return respuesta.body.find?.(
+      (x) => x.id === reserva &&
+             x.ocupacion_hasta === prestamoReprogramado.devolucion_vigente_en
+    );
+  }
+);
+
+check(
+  'Reservas: reprogramacion actualiza ocupacion y conserva contrato',
+  reservaReprogramada.ocupacion_hasta === prestamoReprogramado.devolucion_vigente_en &&
+  reservaReprogramada.hasta === prestamoReprogramado.devolucion_original_en,
+  reservaReprogramada.ocupacion_hasta
+);
+
   await aviso(LENDER, 'Nueva fecha de devolución', 'el prestamista', (n) => n.origen_id === rep2.body.id);
   const esperado = new Date(masHoras(base, 30) + '-05:00').getTime() - 24 * HOUR;
   const filas = sql('lendup_notificaciones', `select date_format(programada_para,'%Y-%m-%dT%H:%i:%sZ') from lendup_notificaciones.notificaciones where origen_id='${reserva}' and clave_notificacion like 'RecordatorioDevolucion:%' and estado='PROGRAMADA'`).out.split('\n');
@@ -334,7 +381,7 @@ async function rutasDelFrontend() {
     Identidad: ['GET /universidades', 'POST /estudiantes', 'GET /estudiantes/me', 'PUT /estudiantes/me', 'POST /estudiantes/me/verificacion', 'POST /estudiantes/me/aceptacion-terminos', `GET /estudiantes/${x}`],
     Reservas: ['POST /solicitudes', 'GET /solicitudes', `GET /solicitudes/${x}`, `POST /solicitudes/${x}/aceptacion`, `POST /solicitudes/${x}/rechazo`, `POST /solicitudes/${x}/cancelacion`, 'GET /reservas', `POST /reservas/${x}/cancelacion`, `GET /reservas/${x}/contacto`],
     Préstamos: [`POST /prestamos/${x}/entrega`, `POST /prestamos/${x}/recepcion`, `POST /prestamos/${x}/extensiones`, `POST /prestamos/${x}/extensiones/${y}/respuesta`, `POST /prestamos/${x}/reprogramaciones`, `POST /prestamos/${x}/reprogramaciones/${y}/respuesta`,
-      `POST /prestamos/${x}/devolucion`, `POST /prestamos/${x}/confirmacion-devolucion`, 'GET /prestamos', 'GET /calendario', `GET /prestamos/${x}`, `POST /prestamos/${x}/extensiones/cotizacion`, `GET /prestamos/${x}/cotizacion-pago`],
+    `POST /prestamos/${x}/devolucion`, `POST /prestamos/${x}/confirmacion-devolucion`, 'GET /prestamos', 'GET /calendario', `GET /prestamos/${x}`, `POST /prestamos/${x}/extensiones/cotizacion`, `GET /prestamos/${x}/cotizacion-pago`],
     Pagos: ['GET /medios-pago', 'POST /pagos', 'POST /garantias', `GET /prestamos/${x}/transacciones`],
     Reputación: [`POST /prestamos/${x}/calificaciones`, `GET /estudiantes/${x}/reputacion`],
     Notificaciones: ['GET /notificaciones', `PATCH /notificaciones/${x}`],
