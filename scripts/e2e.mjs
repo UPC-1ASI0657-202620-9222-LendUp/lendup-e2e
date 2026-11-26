@@ -1,11 +1,10 @@
-// Prueba de punta a punta de todo LendUp por el API Gateway, con los servicios reales. Los eventos nacen de las peticiones
-// HTTP; los de Evidencias se publican a mano porque la suite aún usa el stub.
-// Deja un reporte en reportes/e2e-coordinado.md. Uso: node scripts/e2e.mjs
+// Prueba de punta a punta a través del Gateway. La inyección de eventos se usa para probar transporte e idempotencia.
+// Deja un reporte en reportes/e2e-ocho-microservicios.md. Uso: node scripts/e2e.mjs
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
 import { revisar, revisarEjemplos } from './contratos.mjs';
-import { BORROWER, HOUR, LENDER, OUTSIDER, SPY, call, check, compose, emailOf, ensureUser, env, expect, firebaseAccount, historia, ids, lima, publish, rabbit, results, root, sleep, sql, token, until } from './lib.mjs';
+import { ADMIN, BORROWER, HOUR, LENDER, OUTSIDER, SPY, call, check, compose, disableFirebaseAccount, emailOf, ensureUser, env, expect, firebaseAccount, historia, ids, lima, publish, publishEnvelope, rabbit, results, root, sleep, sql, token, until } from './lib.mjs';
 
 const started = new Date(Date.now() - 2000);
 
@@ -108,7 +107,7 @@ async function identidadYCatalogo() {
     const s = (await call('GET', `/catalogo/publicaciones/${publicacion}/snapshot?desde=${desde}&hasta=${hasta}`, null)).body;
     return call('POST', '/solicitudes', LENDER, { publicacion_id: publicacion, desde, hasta, aceptacion_condiciones: { snapshot_id: s.snapshot_id, snapshot_hash: s.snapshot_hash, aceptada: true } });
   })(), 409);
-  const protegidas = { Préstamos: '/prestamos', Pagos: '/medios-pago', Notificaciones: '/notificaciones' };
+  const protegidas = { Préstamos: '/prestamos', Pagos: '/medios-pago', Notificaciones: '/notificaciones', Evidencias: '/incidencias' };
   for (const [servicio, ruta] of Object.entries(protegidas)) {
     expect(`${servicio}: sin token responde 401`, await call('GET', ruta, null), 401);
     expect(`${servicio}: token inválido responde 401`, await call('GET', ruta, 'raw:no-es-un-token'), 401);
@@ -116,7 +115,7 @@ async function identidadYCatalogo() {
   await firebaseAccount('e2e-sin-verificar', false);
   for (const [servicio, ruta] of Object.entries(protegidas)) expect(`${servicio}: correo sin verificar responde 403`, await call('GET', ruta, 'e2e-sin-verificar'), 403);
   await firebaseAccount('e2e-sin-registro');
-  for (const servicio of ['Préstamos', 'Notificaciones']) {
+  for (const servicio of ['Préstamos', 'Notificaciones', 'Evidencias']) {
     const r = await call('GET', protegidas[servicio], 'e2e-sin-registro');
     check(`${servicio}: cuenta de Firebase sin registro en LendUp no entra`, [401, 403, 404].includes(r.status), `HTTP ${r.status}`);
   }
@@ -387,12 +386,185 @@ async function retencionExpirada() {
     ocupacion.ocupacion_hasta === original && (await loan(prestamo)).devolucion_vigente_en === original);
 }
 
+const incidentBody = (prestamo, id = randomUUID()) => ({
+  prestamo_id: prestamo, tipo: 'DANIO', descripcion: 'Se documentó una diferencia en el estado del objeto.',
+  observaciones: ['Comparar las fotografías.'], clave_idempotencia: id
+});
+const reportar = (body, uid = LENDER) => call('POST', '/incidencias', uid, body);
+const administrar = (id, operacion, uid = ADMIN, body) => call('POST', `/admin/incidencias/${id}/${operacion}`, uid, body);
+const resolver = (id, decision, monto, motivo = 'La administración revisó las pruebas aportadas.') =>
+  administrar(id, 'resolucion', ADMIN, { decision_garantia: decision, monto_garantia_afectado: monto, justificacion_resolucion: motivo });
+const evidenceSql = (query) => sql('lendup_evidencias', query);
+const outboxIncidente = (id, tipo) => evidenceSql(
+  `select envelope from lendup_evidencias.outbox_events where aggregate_id='${id}' and routing_key='evidencias.incidencia-${tipo}.v1' and published_at is not null`);
+
+async function prepararAdministrador() {
+  await ensureUser(ADMIN);
+  const promote = sql('lendup_identidad', `update lendup_identidad.usuarios set rol_id=(select id from lendup_identidad.roles where codigo='ADMINISTRADOR') where id='${ids[ADMIN]}'`);
+  check('Identidad: se preparó un administrador persistido para E2E', promote.ok);
+  const internal = 'http://localhost:8085/internal/v1/identidad';
+  const credential = 'raw:' + env.IDENTITY_EVIDENCE_SERVICE_TOKEN;
+  expect('Identidad: Evidencias obtiene el UUID vinculado a Firebase', await call('GET', `/firebase/${ADMIN}`, credential, undefined, internal), 200,
+    (b) => b.usuario_id === ids[ADMIN] && Object.keys(b).length === 1);
+  for (const [uid, rol] of [[ADMIN, 'ADMINISTRADOR'], [LENDER, 'ESTUDIANTE']]) {
+    expect(`Identidad: Evidencias consulta el rol persistido ${rol}`, await call('GET', `/usuarios/${ids[uid]}/rol`, credential, undefined, internal), 200,
+      (b) => b.rol === rol && Object.keys(b).length === 1);
+  }
+  expect('Identidad: Evidencias no puede consultar correo', await call('GET', `/usuarios/${ids[LENDER]}/correo`, credential, undefined, internal), 403);
+  const firebaseToken = 'raw:' + await token(ADMIN);
+  await disableFirebaseAccount(ADMIN, true);
+  try {
+    expect('Evidencias: un administrador Firebase deshabilitado no accede con su token anterior',
+      await call('GET', '/admin/incidencias', firebaseToken), 401);
+  } finally {
+    await disableFirebaseAccount(ADMIN, false);
+  }
+}
+
+async function contratoPrivado(prestamo, reserva) {
+  const base = 'http://localhost:8087/internal/v1/prestamos';
+  const incident = `/${prestamo}/incidencias`;
+  const contact = `/reservas/${reserva}/participantes/${ids[LENDER]}/contacto`;
+  const evidence = 'raw:' + env.LOANS_EVIDENCE_SERVICE_TOKEN;
+  const reservations = 'raw:' + env.LOANS_RESERVATIONS_SERVICE_TOKEN;
+  expect('Préstamos: contrato privado devuelve exclusivamente las condiciones pactadas y los participantes',
+    await call('GET', incident, evidence, undefined, base), 200,
+    (b) => Object.keys(b).length === 5 && b.id === prestamo && b.garantia_monetaria_acordada === 50 && b.moneda === 'PEN' &&
+      b.prestamista_usuario_id === ids[LENDER] && b.prestatario_usuario_id === ids[BORROWER]);
+  expect('Préstamos: contrato privado devuelve 404 para un identificador inexistente',
+    await call('GET', `/${randomUUID()}/incidencias`, evidence, undefined, base), 404);
+  expect('Préstamos: Reservas conserva permiso para contactos', await call('GET', contact, reservations, undefined, base), 200);
+  expect('Préstamos: Reservas no puede consultar incidencias', await call('GET', incident, reservations, undefined, base), 403);
+  expect('Préstamos: Evidencias no puede consultar contactos', await call('GET', contact, evidence, undefined, base), 403);
+  for (const [nombre, credencial] of [['ausente', null], ['corta', 'raw:corta'], ['incorrecta', 'raw:' + randomUUID()], ['Firebase', LENDER]]) {
+    expect(`Préstamos: rechaza credencial interna ${nombre}`, await call('GET', incident, credencial, undefined, base), 401);
+  }
+  expect('Gateway: no publica los datos administrativos de Préstamos',
+    await call('GET', '/internal/v1/prestamos' + incident, evidence, undefined, 'http://localhost:8090'), 404);
+  const seal = `/internal/v1/prestamos/${prestamo}/cierre-incidencias`;
+  expect('Gateway: no publica el sellado de Evidencias', await call('POST', seal, LENDER, undefined, 'http://localhost:8090'), 404);
+  expect('Evidencias: el sellado rechaza credenciales Firebase', await call('POST', seal, LENDER, undefined, 'http://localhost:8088'), 401);
+}
+
+async function acuerdoDespuesDeEditar(reserva, publicacion) {
+  const route = `/internal/v1/reservas/${reserva}/acuerdo`;
+  const base = 'http://localhost:8081';
+  const credential = 'raw:' + env.RESERVATIONS_EVIDENCE_SERVICE_TOKEN;
+  const read = (uid) => call('GET', route, uid, undefined, base);
+  const original = await read(credential);
+  expect('Reservas: Evidencias recibe solo el acuerdo original', original, 200, (b) =>
+    b.id === reserva && b.condiciones_uso_acordadas === 'Uso académico' &&
+    b.condiciones_entrega_acordadas === 'Entrega personal' && b.condiciones_devolucion_acordadas === 'Mismo estado' &&
+    b.condiciones_cancelacion_acordadas === 'Antes de la entrega' && b.lugar_intercambio_acordado === 'Campus Monterrico' &&
+    !!b.condiciones_aceptadas_en && !!b.condiciones_snapshot_hash &&
+    Object.keys(b).length === 14);
+  expect('Reservas: un usuario Firebase no obtiene el snapshot privado', await read(LENDER), 401,
+    (b) => b.error === 'CREDENCIAL_DE_SERVICIO_INVALIDA' && b.message === 'Credencial de servicio inválida');
+  expect('Reservas: la credencial de Préstamos no obtiene el snapshot privado', await read('raw:' + env.LOANS_RESERVATIONS_SERVICE_TOKEN), 401);
+  expect('Reservas: la credencial de Evidencias solo tiene acceso de lectura al acuerdo',
+    await call('POST', route, credential, undefined, base), 403);
+  expect('Reservas: credencial de Evidencias no obtiene contactos por la ruta pública',
+    await call('GET', `/api/v1/reservas/${reserva}/contacto`, credential, undefined, base), 401);
+  expect('Gateway: mantiene privado el acuerdo de Reservas',
+    await call('GET', route, credential, undefined, 'http://localhost:8090'), 404);
+  const edit = await call('PATCH', `/catalogo/publicaciones/${publicacion}`, LENDER, {
+    condiciones: { condicionesUso: 'Uso actualizado después de reservar', condicionesEntrega: 'Entrega posterior',
+      condicionesDevolucion: 'Devolución posterior', condicionesCancelacion: 'Cancelación posterior',
+      lugarIntercambio: 'Lugar posterior', garantiaMonetaria: 75 },
+  });
+  expect('Catálogo: acepta editar la publicación después de la reserva', edit, 200,
+    (b) => b.condiciones.condicionesUso === 'Uso actualizado después de reservar' && b.condiciones.garantiaMonetaria === 75);
+  const unchanged = (b) => Object.keys(original.body).every((key) => b?.[key] === original.body[key]);
+  expect('Reservas: conserva importes, condiciones, periodo y prueba de aceptación tras editar Catálogo',
+    await read(credential), 200, unchanged);
+  return unchanged;
+}
+
+function foto(form, campo) {
+  // JPEG de 1 píxel usado por los proveedores locales.
+  const jpeg = Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wAALCAABAAEBAREA/8QAFAABAAAAAAAAAAAAAAAAAAAACv/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8Af//Z', 'base64');
+  form.append(campo, new Blob([jpeg], { type: 'image/jpeg' }), 'evidencia.jpg');
+}
+
+async function subirFoto(prestamo, etapa, actor) {
+  const form = new FormData();
+  form.set('etapa', etapa);
+  form.set('uploadId', randomUUID());
+  foto(form, 'file');
+  const ruta = `/prestamos/${prestamo}/evidencias`;
+  const subida = await call('POST', ruta, actor, form);
+  expect(`Evidencias: registra foto multipart de ${etapa}`, subida, 201,
+    (b) => b.etapa === etapa && b.tipo === 'FOTO' && b.estado_integracion === 'COMPLETADA' && !!b.cloudinary_public_id);
+  expect(`Evidencias: reintenta la foto de ${etapa} sin duplicarla`, await call('POST', ruta, actor, form), 201, (b) => b.id === subida.body.id);
+  return subida.body.id;
+}
+
 async function incidencias() {
-  historia('8. Incidencia con afectación parcial (Evidencias simulada: publica sus eventos según el contrato)');
-  const { prestamo } = await activo(Date.now() - HOUR, Date.now() + 23 * HOUR, 20);
+  historia('8. Evidencias reales, revisión e incidencia con afectación parcial');
+  await prepararAdministrador();
+  const { prestamo, reserva, publicacion } = await reservar(Date.now() - HOUR, Date.now() + 23 * HOUR);
+  await contratoPrivado(prestamo, reserva);
+  const acuerdoOriginal = await acuerdoDespuesDeEditar(reserva, publicacion);
+  await pagarTodo(prestamo, 20);
+  const evidencePath = `/prestamos/${prestamo}/evidencias`;
+  expect('Evidencias: registra observación de entrega por JSON', await call('POST', evidencePath, LENDER,
+    { etapa: 'ENTREGA', tipo: 'OBSERVACION', observacion: 'Objeto inspeccionado antes de entregar.' }), 201);
+  const initial = await subirFoto(prestamo, 'ENTREGA', LENDER);
+  await entregarYRecibir(prestamo);
+  const final = await subirFoto(prestamo, 'DEVOLUCION', BORROWER);
+  expect('Evidencias: el participante puede consultar registros reales', await call('GET', evidencePath, BORROWER), 200,
+    (b) => b.some((e) => e.id === initial) && b.some((e) => e.id === final));
+  expect('Evidencias: un usuario ajeno no puede consultar registros', await call('GET', evidencePath, OUTSIDER), 403);
+  check('Préstamos: el detalle contiene las evidencias de MySQL', (await loan(prestamo)).evidencias.some((e) => e.id === final));
+  const analysisPath = `/prestamos/${prestamo}/analisis-evidencias`;
+  const analysis = await call('POST', analysisPath, BORROWER, { evidencia_inicial_id: initial, evidencia_final_id: final });
+  expect('Evidencias: acepta las fotografías verificadas para analizar', analysis, 201, (b) => b.estado === 'PENDIENTE');
+  const analysisDone = await until('que termine el análisis', async () => {
+    const r = await call('GET', `${analysisPath}/${analysis.body.id}`, LENDER);
+    return r.body.estado === 'COMPLETADO' && r;
+  });
+  expect('Gateway: permite consultar el análisis y requiere revisión humana', analysisDone, 200,
+    (b) => b.resultado_detalle.requiere_revision_humana === true && b.resultado_detalle.comparabilidad === 'MEDIA');
   expect('Préstamos: devolución registrada', await call('POST', `/prestamos/${prestamo}/devolucion`, BORROWER), 200);
-  const incidencia = randomUUID(), payload = { incidencia_id: incidencia, prestamo_id: prestamo, prestatario_usuario_id: ids[BORROWER], prestamista_usuario_id: ids[LENDER] };
-  check('Broker: evidencias.incidencia-reportada.v1 tiene suscriptores', await publish('evidencias.incidencia-reportada.v1', 'IncidenciaReportada', incidencia, payload));
+  const body = incidentBody(prestamo);
+  const incidencia = body.clave_idempotencia;
+  expect('Evidencias: el usuario ajeno no puede reportar', await reportar(body, OUTSIDER), 403);
+  const report = new FormData();
+  report.set('reporte', new Blob([JSON.stringify(body)], { type: 'application/json' }));
+  foto(report, 'fotos');
+  expect('Evidencias: registra incidencia multipart con foto y observación', await call('POST', '/incidencias', LENDER, report), 201,
+    (b) => b.id === incidencia && b.estado === 'PENDIENTE' && b.evidencias.length === 2);
+  expect('Evidencias: reintentar el reporte conserva la misma incidencia', await reportar(body), 201,
+    (b) => b.id === incidencia && b.evidencias.length === 2);
+  expect('Evidencias: detecta reutilización de clave con contenido diferente',
+    await reportar({ ...body, descripcion: 'Esta descripción es distinta de la original.' }), 409);
+  expect('Evidencias: el participante puede consultar su incidencia', await call('GET', `/incidencias/${incidencia}`, BORROWER), 200,
+    (b) => b.id === incidencia && b.prestamo.id === prestamo && b.garantia_monetaria_acordada === 50);
+  expect('Evidencias: el usuario ajeno no consulta la incidencia', await call('GET', `/incidencias/${incidencia}`, OUTSIDER), 403);
+  expect('Evidencias: el administrador puede consultar el detalle y sus pruebas',
+    await call('GET', `/incidencias/${incidencia}`, ADMIN), 200,
+    (b) => b.prestamo.id === prestamo && b.prestamo.garantia_monetaria_acordada === 50 && b.evidencias.length === 2);
+  expect('Evidencias: el detalle administrativo presenta el acuerdo aceptado antes del cambio de Catálogo',
+    await call('GET', `/incidencias/${incidencia}`, ADMIN), 200, (b) => acuerdoOriginal(b.reserva));
+  expect('Evidencias: el listado del participante incluye la incidencia', await call('GET', '/incidencias', BORROWER), 200,
+    (b) => b.some((i) => i.id === incidencia));
+  expect('Evidencias: un estudiante no inicia revisión administrativa', await administrar(incidencia, 'revision', LENDER), 403);
+  expect('Evidencias: un estudiante no lista la bandeja administrativa', await call('GET', '/admin/incidencias', BORROWER), 403);
+  expect('Evidencias: el administrador lista las incidencias pendientes', await call('GET', '/admin/incidencias?estado=PENDIENTE&tipo=DANIO', ADMIN), 200,
+    (b) => b.some((i) => i.id === incidencia && i.garantia_monetaria_acordada === 50 && i.prestamo.id === prestamo));
+  expect('Evidencias: la bandeja administrativa conserva el acuerdo original',
+    await call('GET', '/admin/incidencias?estado=PENDIENTE&tipo=DANIO', ADMIN), 200,
+    (b) => b.some((i) => i.id === incidencia && acuerdoOriginal(i.reserva)));
+  expect('Evidencias: el administrador inicia la revisión', await administrar(incidencia, 'revision'), 200, (b) => b.estado === 'EN_REVISION');
+  expect('Evidencias: el administrador agrega una observación', await administrar(incidencia, 'observaciones', ADMIN,
+    { contenido: 'Se compararán las fotos originales.' }), 200, (b) => b.observaciones.length === 1);
+  const statement = { contenido: 'La contraparte presentó su descargo con contexto suficiente.' };
+  expect('Evidencias: solo la contraparte presenta descargo', await call('POST', `/incidencias/${incidencia}/descargo`, LENDER, statement), 403);
+  expect('Evidencias: guarda el descargo de la contraparte', await call('POST', `/incidencias/${incidencia}/descargo`, BORROWER, statement), 200,
+    (b) => b.descargo === statement.contenido);
+  expect('Evidencias: rechaza el descargo repetido', await call('POST', `/incidencias/${incidencia}/descargo`, BORROWER, statement), 409);
+  const published = await until('publicación del reporte real', () => outboxIncidente(incidencia, 'reportada').out);
+  check('Broker: evidencias.incidencia-reportada.v1 tiene suscriptores', JSON.parse(published).payload.incidencia_id === incidencia);
   await until('que Préstamos registre la incidencia', async () => (await loan(prestamo)).estado_detalle === 'PENDIENTE_INCIDENCIA');
   check('Préstamos: queda PENDIENTE_INCIDENCIA', true);
   expect('Préstamos: no se puede cerrar con una incidencia pendiente', await call('POST', `/prestamos/${prestamo}/confirmacion-devolucion`, LENDER), 409);
@@ -400,41 +572,53 @@ async function incidencias() {
   check('Pagos: la garantía queda RETENIDA_POR_INCIDENCIA (RF41)', true);
   await aviso(BORROWER, 'Incidencia reportada', 'el prestatario', (n) => n.origen_id === incidencia);
   const adelantada = randomUUID();
-  const otra = { ...payload, incidencia_id: adelantada };
-  check('Contrato simulado: resolución sin afectación llega antes de su reporte', await publish(
+  const real = JSON.parse(published);
+  const otra = { ...real.payload, incidencia_id: adelantada };
+  check('Inyección controlada: resolución sin afectación llega antes de su reporte', await publish(
     'evidencias.incidencia-resuelta.v1', 'IncidenciaResuelta', adelantada,
-    { ...otra, decision_garantia: 'SIN_AFECTACION', monto_garantia_afectado: 0, moneda: 'PEN' }));
+    { ...otra, decision_garantia: 'SIN_AFECTACION', monto_garantia_afectado: 0, moneda: 'PEN',
+      justificacion_resolucion: 'Caso controlado de evento fuera de orden.' }));
   await publish('evidencias.incidencia-reportada.v1', 'IncidenciaReportada', adelantada, otra);
-  await publish('evidencias.incidencia-reportada.v1', 'IncidenciaReportada', incidencia, payload);
+  await publishEnvelope('evidencias.incidencia-reportada.v1', real);
   await until('que Pagos proyecte la resolución adelantada', async () => sql('lendup_pagos',
     `select decision from lendup_pagos.guarantee_incident_projection where incident_id='${adelantada}'`).out === 'SIN_AFECTACION');
   await until('que Préstamos proyecte la resolución adelantada', async () => sql('lendup_prestamos',
     `select resolved from lendup_prestamos.loan_incident_projection where incident_id='${adelantada}'`).out === '1');
   expect('Préstamos: una resolución adelantada no cierra otra incidencia', await call('POST', `/prestamos/${prestamo}/confirmacion-devolucion`, LENDER), 409);
-  check('Broker: evidencias.incidencia-resuelta.v1 tiene suscriptores', await publish('evidencias.incidencia-resuelta.v1', 'IncidenciaResuelta', incidencia, { ...payload, decision_garantia: 'AFECTACION_PARCIAL', monto_garantia_afectado: 20, moneda: 'PEN', justificacion_resolucion: 'Daño leve comprobado.' }));
+  const reason = 'Daño leve comprobado en ambas fotografías.';
+  expect('Evidencias: registra la resolución parcial y calcula saldo y moneda con datos pactados',
+    await administrar(incidencia, 'resolucion', ADMIN, { decision_garantia: 'AFECTACION_PARCIAL', monto_garantia_afectado: 20,
+      justificacion_resolucion: reason, saldo_garantia_previsto: 999, moneda: 'USD' }), 200,
+    (b) => b.estado === 'RESUELTA' && Number(b.monto_garantia_afectado) === 20 && Number(b.saldo_garantia_previsto) === 30 && b.moneda === 'PEN');
+  expect('Evidencias: rechaza una segunda resolución', await resolver(incidencia, 'AFECTACION_PARCIAL', 20, reason), 409);
+  const resolved = await until('publicación de la resolución real', () => outboxIncidente(incidencia, 'resuelta').out);
+  check('Broker: evidencias.incidencia-resuelta.v1 tiene suscriptores', JSON.parse(resolved).payload.incidencia_id === incidencia);
+  await publishEnvelope('evidencias.incidencia-resuelta.v1', JSON.parse(resolved));
   const tx = await transaccion(prestamo, 'RETENCION_GARANTIA');
   check('Pagos: retiene 20 sin devolver saldo antes de confirmación', tx.monto === 20 &&
     !(await transacciones(prestamo)).some((t) => t.tipo === 'DEVOLUCION_GARANTIA'));
-  await aviso(LENDER, 'Incidencia resuelta', 'el prestamista', (n) => n.origen_id === incidencia && n.mensaje === 'Daño leve comprobado.');
+  await aviso(LENDER, 'Incidencia resuelta', 'el prestamista', (n) => n.origen_id === incidencia && n.mensaje === reason);
   await aviso(LENDER, 'Garantía retenida', 'el prestamista');
   await until('que Préstamos libere el cierre', async () => (await loan(prestamo)).estado_detalle === 'DEVOLUCION_REGISTRADA');
   expect('Préstamos: resuelta la incidencia, se puede finalizar', await call('POST', `/prestamos/${prestamo}/confirmacion-devolucion`, LENDER), 200, (b) => b.estado === 'FINALIZADO');
   const dev = await transaccion(prestamo, 'DEVOLUCION_GARANTIA');
   check('Pagos: devuelve exactamente 30 una vez tras el cierre', dev.monto === 30 &&
     (await transacciones(prestamo)).filter((t) => t.tipo === 'DEVOLUCION_GARANTIA').length === 1);
+  check('Pagos: la redifusión de la resolución no duplica la retención',
+    (await transacciones(prestamo)).filter((t) => t.tipo === 'RETENCION_GARANTIA').length === 1);
   await aviso(BORROWER, 'Garantía devuelta', 'el prestatario', (n) => fecha(n) >= started && n.mensaje.includes('30'));
 }
 
 async function incidenciaConRetencionTotal() {
-  historia('Garantía: afectación total autorizada (Evidencias simulada)');
+  historia('Garantía: afectación total autorizada por Evidencias');
   const { prestamo } = await activo(Date.now() - HOUR, Date.now() + 23 * HOUR, 20);
   expect('Garantía total: se registra el objeto devuelto', await call('POST', `/prestamos/${prestamo}/devolucion`, BORROWER), 200);
-  const id = randomUUID();
-  const payload = { incidencia_id: id, prestamo_id: prestamo, prestatario_usuario_id: ids[BORROWER], prestamista_usuario_id: ids[LENDER] };
-  await publish('evidencias.incidencia-reportada.v1', 'IncidenciaReportada', id, payload);
+  const body = incidentBody(prestamo);
+  const id = body.clave_idempotencia;
+  expect('Evidencias: registra la incidencia de afectación total', await reportar(body), 201);
   await until('que Préstamos proyecte la incidencia total', async () => (await loan(prestamo)).estado_detalle === 'PENDIENTE_INCIDENCIA');
-  await publish('evidencias.incidencia-resuelta.v1', 'IncidenciaResuelta', id,
-    { ...payload, decision_garantia: 'AFECTACION_TOTAL', monto_garantia_afectado: 50, moneda: 'PEN' });
+  expect('Evidencias: inicia la revisión de la afectación total', await administrar(id, 'revision'), 200);
+  expect('Evidencias: autoriza el saldo total pactado', await resolver(id, 'AFECTACION_TOTAL', 50), 200);
   const aplicada = await transaccion(prestamo, 'RETENCION_GARANTIA');
   check('Pagos: registra retención total de los 50 autorizados', aplicada.monto === 50);
   await until('que Préstamos permita el cierre tras afectación total', async () => (await loan(prestamo)).estado_detalle === 'DEVOLUCION_REGISTRADA');
@@ -442,6 +626,194 @@ async function incidenciaConRetencionTotal() {
   await until('que Pagos procese el cierre con saldo cero', async () => sql('lendup_pagos',
     `select count(*) from lendup_pagos.guarantee_closures where loan_id='${prestamo}'`).out === '1');
   check('Pagos: saldo cero tras el cierre sin devolución adicional', !(await transacciones(prestamo)).some((t) => t.tipo === 'DEVOLUCION_GARANTIA'));
+}
+
+async function concurrenciaYOutbox() {
+  historia('Evidencias: carrera entre reporte, resolución y cierre con RabbitMQ detenido');
+  const { prestamo } = await activo(Date.now() - HOUR, Date.now() + 23 * HOUR, 20);
+  const returnPath = `/prestamos/${prestamo}/confirmacion-devolucion`;
+  expect('Préstamos: registra la devolución física', await call('POST', `/prestamos/${prestamo}/devolucion`, BORROWER), 200);
+  const a = incidentBody(prestamo), b = incidentBody(prestamo), c = incidentBody(prestamo);
+  const first = a.clave_idempotencia, second = b.clave_idempotencia, third = c.clave_idempotencia;
+  compose('pause', 'rabbitmq');
+  try {
+    expect('Evidencias: persiste el reporte aunque RabbitMQ esté detenido', await reportar(a), 201);
+    check('Evidencias: el reporte y el Outbox existen antes de publicarse',
+      evidenceSql(`select count(*) from lendup_evidencias.incidencias i join lendup_evidencias.outbox_events e on e.aggregate_id=i.id where i.id='${first}' and e.published_at is null`).out === '1');
+    check('Préstamos: el reporte aún no está proyectado',
+      (await loan(prestamo)).estado_detalle === 'DEVOLUCION_REGISTRADA');
+    expect('Préstamos: el reporte persistido bloquea el cierre durante la ventana del Outbox',
+      await call('POST', returnPath, LENDER), 409);
+    expect('Evidencias: el préstamo admite una segunda incidencia', await reportar(b, BORROWER), 201);
+    expect('Evidencias: el préstamo admite una tercera incidencia', await reportar(c), 201);
+    for (const id of [first, second, third]) {
+      expect('Evidencias: cada incidencia se revisa antes de resolverse', await administrar(id, 'revision'), 200);
+    }
+    const concurrent = await Promise.all([resolver(first, 'AFECTACION_PARCIAL', 30), resolver(second, 'AFECTACION_PARCIAL', 30)]);
+    check('Evidencias: dos resoluciones concurrentes de 30 no superan la garantía de 50',
+      concurrent.filter((r) => r.status === 200).length === 1 && concurrent.filter((r) => r.status === 400).length === 1,
+      concurrent.map((r) => r.status).join(', '));
+    const rejected = concurrent[0].status === 400 ? first : second;
+    const accepted = rejected === first ? second : first;
+    expect('Evidencias: puede resolver sin afectación con la otra decisión registrada',
+      await resolver(third, 'SIN_AFECTACION', 0), 200, (x) => Number(x.saldo_garantia_previsto) === 20);
+    const [close, decision] = await Promise.all([call('POST', returnPath, LENDER), resolver(rejected, 'AFECTACION_TOTAL', 20)]);
+    expect('Evidencias: la afectación total autoriza solo el saldo restante', decision, 200, (x) => Number(x.saldo_garantia_previsto) === 0);
+    check('Préstamos: el intento concurrente se serializa con la última resolución', [200, 409].includes(close.status), `HTTP ${close.status}`);
+    if (close.status === 409) expect('Préstamos: reintenta el cierre cuando todas están resueltas', await call('POST', returnPath, LENDER), 200);
+    const cierre = sql('lendup_prestamos', `select payload from lendup_prestamos.outbox_events where aggregate_id=uuid_to_bin('${prestamo}') and event_type='PrestamoFinalizado'`);
+    check('Préstamos: registra un cierre con las tres decisiones antes de recibir sus eventos',
+      cierre.ok && [first, second, third].every((id) => cierre.out.includes(id)));
+    expect('Evidencias: bloquea un nuevo reporte después del sellado', await reportar(incidentBody(prestamo)), 409);
+    check('Pagos: todavía no devuelve la garantía con la mensajería detenida',
+      !(await transacciones(prestamo)).some((t) => t.tipo === 'DEVOLUCION_GARANTIA'));
+    await until('un reintento persistido en el Outbox de Evidencias', () => Number(evidenceSql(
+      `select count(*) from lendup_evidencias.outbox_events where aggregate_id in ('${accepted}','${rejected}') and attempts>0 and published_at is null`).out) > 0);
+    check('Evidencias: el Outbox agenda el reintento sin perder la decisión', true);
+  } finally {
+    compose('unpause', 'rabbitmq');
+  }
+  const liquidado = await until('las dos retenciones exactas tras recuperar RabbitMQ', async () => {
+    const list = await transacciones(prestamo);
+    const values = list.filter?.((t) => t.tipo === 'RETENCION_GARANTIA').map((t) => t.monto).sort((x, y) => x - y);
+    return values?.length === 2 && { list, values };
+  }, 90);
+  check('Pagos: retiene 30 y 20 exactamente una vez sin devolver saldo',
+    liquidado.values.join(',') === '20,30' && !liquidado.list.some((t) => t.tipo === 'DEVOLUCION_GARANTIA'));
+  await aviso(LENDER, 'Incidencia resuelta', 'el prestamista', (n) => n.origen_id === third);
+  await inboxYPersistencia(prestamo, third);
+}
+
+async function inboxYPersistencia(prestamo, incidencia) {
+  historia('Evidencias: Inbox idempotente, versiones atrasadas y persistencia tras reinicio');
+  const proyeccion = () => evidenceSql(`select estado, state_version from lendup_evidencias.loan_projection where prestamo_id='${prestamo}'`).out;
+  const final = await until('la proyección FINALIZADO en el Inbox', () => {
+    const row = proyeccion();
+    return row.startsWith('FINALIZADO\t') && row;
+  });
+  const out = sql('lendup_prestamos', `
+    select json_object('event_id',bin_to_uuid(id),'event_type',event_type,'event_version',event_version,
+      'aggregate_id',bin_to_uuid(aggregate_id),'aggregate_version',aggregate_version,
+      'occurred_at',concat(date_format(occurred_at,'%Y-%m-%dT%H:%i:%s.%f'),'Z'),'correlation_id',correlation_id,'payload',payload)
+    from lendup_prestamos.outbox_events where aggregate_id=uuid_to_bin('${prestamo}') and event_type='PrestamoCreado'`);
+  check('Evidencias: existe un evento real de creación para repetir', out.ok && out.out.length > 0);
+  const created = JSON.parse(out.out);
+  const older = { ...created, event_id: randomUUID() };
+  const testExchange = `e2e.evidence.inbox.${randomUUID()}`;
+  const queue = 'evidence.events.v1', route = 'prestamos.creado.v1';
+  const inboxCount = (id) => evidenceSql(`select count(*) from lendup_evidencias.inbox_events where id='${id}'`).out;
+  check('Evidencias: el Inbox ya confirmó exactamente una vez la creación real', inboxCount(created.event_id) === '1');
+  await rabbit('PUT', `/exchanges/%2F/${testExchange}`, { type: 'direct', durable: false });
+  try {
+    await rabbit('POST', `/bindings/%2F/e/${testExchange}/q/${queue}`, { routing_key: route });
+    for (const message of [created, older]) {
+      const response = await rabbit('POST', `/exchanges/%2F/${testExchange}/publish`, {
+        routing_key: route, payload: JSON.stringify(message), payload_encoding: 'string', properties: { content_type: 'application/json' },
+      });
+      check('RabbitMQ: la redifusión de prueba llega al Inbox de Evidencias', response.routed);
+    }
+    await until('la confirmación del evento con versión antigua', () => inboxCount(older.event_id) === '1');
+    check('Evidencias: la entrega repetida conserva una sola fila por ID de evento', inboxCount(created.event_id) === '1');
+    check('Evidencias: una creación atrasada no revierte FINALIZADO', proyeccion() === final);
+  } finally {
+    await rabbit('DELETE', `/exchanges/%2F/${testExchange}`);
+  }
+  compose('restart', 'evidence');
+  await until('que Evidencias vuelva después del reinicio', async () =>
+    fetch('http://localhost:8088/health').then((r) => r.ok).catch(() => false), 90);
+  expect('Evidencias: conserva la resolución del incidente tras reiniciar', await call('GET', `/incidencias/${incidencia}`, BORROWER), 200,
+    (b) => b.estado === 'RESUELTA' && b.decision_garantia === 'SIN_AFECTACION');
+  check('Evidencias: conserva el Inbox y la proyección tras reiniciar', inboxCount(older.event_id) === '1' && proyeccion() === final);
+}
+
+async function recuperacionConIncidencia() {
+  historia('Evidencias: recuperación física con reporte simultáneo y devolución del saldo');
+  const { prestamo, reserva } = await reservar(Date.now() - HOUR, Date.now() + 23 * HOUR);
+  await pagarTodo(prestamo, 20);
+  expect('Préstamos: registra entrega para recuperación', await call('POST', `/prestamos/${prestamo}/entrega`, LENDER), 200);
+  const cancellation = await call('POST', `/reservas/${reserva}/cancelacion`, BORROWER, { motivo_cancelacion: 'Se coordina recuperar el objeto ya entregado.' });
+  expect('Reservas: acepta solicitud de cancelación durante la entrega', cancellation, 200);
+  await until('la recuperación pendiente', async () => (await loan(prestamo)).estado_detalle === 'RECUPERACION_PENDIENTE');
+  const partial = incidentBody(prestamo);
+  expect('Evidencias: admite reportes durante la recuperación física', await reportar(partial), 201);
+  expect('Evidencias: revisa el daño durante la recuperación', await administrar(partial.clave_idempotencia, 'revision'), 200);
+  expect('Evidencias: autoriza retener 15 de la garantía', await resolver(partial.clave_idempotencia, 'AFECTACION_PARCIAL', 15), 200);
+  await until('que Préstamos proyecte la primera decisión de recuperación', () => sql('lendup_prestamos',
+    `select resolved from lendup_prestamos.loan_incident_projection where incident_id='${partial.clave_idempotencia}'`).out === '1');
+  const data = incidentBody(prestamo);
+  const id = data.clave_idempotencia;
+  const confirmPath = `/prestamos/${prestamo}/confirmacion-recuperacion`;
+  const [report, close] = await Promise.all([reportar(data), call('POST', confirmPath, LENDER)]);
+  check('Evidencias y Préstamos: solo se acepta el reporte o el cierre simultáneo',
+    (report.status === 201 && close.status === 409) || (report.status === 409 && close.status === 200),
+    `reporte HTTP ${report.status}, confirmación HTTP ${close.status}`);
+  if (report.status === 201) {
+    expect('Evidencias: revisa la incidencia durante la recuperación', await administrar(id, 'revision'), 200);
+    expect('Evidencias: cierra sin afectación el reporte concurrente', await resolver(id, 'SIN_AFECTACION', 0), 200);
+    await until('que Préstamos proyecte la resolución de recuperación', () => sql('lendup_prestamos',
+      `select resolved from lendup_prestamos.loan_incident_projection where incident_id='${id}'`).out === '1');
+    expect('Préstamos: confirma la recuperación física tras la resolución', await call('POST', confirmPath, LENDER), 200);
+  }
+  const refund = await transaccion(prestamo, 'DEVOLUCION_GARANTIA');
+  check('Pagos: devuelve 35 después de la recuperación y conserva la retención de 15', refund.monto === 35 &&
+    (await transacciones(prestamo)).some((t) => t.tipo === 'RETENCION_GARANTIA' && t.monto === 15));
+}
+
+async function cierreTrasRollback() {
+  historia('Evidencias: indisponibilidad, rollback de Préstamos y recuperación de un sello huérfano');
+  const { prestamo } = await activo(Date.now() - HOUR, Date.now() + 23 * HOUR, 20);
+  const path = `/prestamos/${prestamo}/confirmacion-devolucion`;
+  expect('Préstamos: registra la devolución antes de probar fallos de cierre',
+    await call('POST', `/prestamos/${prestamo}/devolucion`, BORROWER), 200);
+  const snapshot = async () => (await call('GET', '/prestamos', LENDER)).body.find((row) => row.id === prestamo);
+  const outboxCount = () => sql('lendup_prestamos',
+    `select count(*) from lendup_prestamos.outbox_events where aggregate_id=uuid_to_bin('${prestamo}') and event_type='PrestamoFinalizado'`).out;
+  compose('stop', 'evidence');
+  try {
+    expect('Préstamos: rechaza el cierre si Evidencias está indisponible', await call('POST', path, LENDER), 503);
+    check('Préstamos: conserva estado y Outbox ante la indisponibilidad',
+      (await snapshot()).estado_detalle === 'DEVOLUCION_REGISTRADA' && outboxCount() === '0');
+  } finally {
+    compose('start', 'evidence');
+  }
+  await until('que Evidencias vuelva para la prueba de rollback', async () =>
+    fetch('http://localhost:8088/health').then((r) => r.ok).catch(() => false), 90);
+  const fault = `e2e_cierre_${prestamo.replaceAll('-', '')}`;
+  const ddl = `alter table lendup_prestamos.prestamos add constraint ${fault}
+    check (id <> X'${prestamo.replaceAll('-', '')}' or estado <> 'FINALIZADO')`;
+  const installed = sql('lendup_prestamos', ddl);
+  check('MySQL: instala un fallo de escritura acotado al préstamo de prueba', installed.ok, installed.out);
+  try {
+    const close = await call('POST', path, LENDER);
+    check('Préstamos: falla al persistir el cierre después de que Evidencias sella',
+      [409, 500].includes(close.status) && evidenceSql(
+        `select count(*) from lendup_evidencias.cierres_incidencias where prestamo_id='${prestamo}' and sellado=1 and sello_id is not null`).out === '1',
+      `HTTP ${close.status}`);
+    check('Préstamos: el rollback conserva la devolución registrada y no crea evento',
+      (await snapshot()).estado_detalle === 'DEVOLUCION_REGISTRADA' && outboxCount() === '0');
+    check('Pagos: el rollback no genera devolución de garantía',
+      (await transacciones(prestamo)).every((t) => t.tipo !== 'DEVOLUCION_GARANTIA'));
+  } finally {
+    const removed = sql('lendup_prestamos', `alter table lendup_prestamos.prestamos drop check ${fault}`);
+    if (!removed.ok) throw new Error(`No se pudo retirar la restricción temporal ${fault}`);
+  }
+  const report = incidentBody(prestamo);
+  const incident = report.clave_idempotencia;
+  expect('Evidencias: un reporte recupera el sello huérfano sin reintentar el cierre',
+    await reportar(report), 201, (b) => b.id === incident);
+  expect('Préstamos: el reporte recuperado vuelve a bloquear el cierre', await call('POST', path, LENDER), 409);
+  expect('Evidencias: revisa la incidencia tras recuperar la admisión', await administrar(incident, 'revision'), 200);
+  expect('Evidencias: resuelve sin afectación tras el rollback', await resolver(incident, 'SIN_AFECTACION', 0), 200);
+  await until('que Préstamos proyecte la resolución tras el rollback', async () =>
+    (await snapshot()).estado_detalle === 'DEVOLUCION_REGISTRADA');
+  const finished = await call('POST', path, LENDER);
+  expect('Préstamos: el siguiente cierre confirma la devolución', finished, 200, (b) => b.estado === 'FINALIZADO');
+  expect('Préstamos: reintentar un cierre confirmado devuelve el mismo resultado', await call('POST', path, LENDER), 200,
+    (b) => b.estado === 'FINALIZADO' && b.devolucion_confirmada_en === finished.body.devolucion_confirmada_en);
+  check('Préstamos: queda un único evento de finalización tras reintentar', outboxCount() === '1');
+  expect('Evidencias: el cierre confirmado impide reabrir la admisión', await reportar(incidentBody(prestamo)), 409);
+  const refund = await transaccion(prestamo, 'DEVOLUCION_GARANTIA');
+  check('Pagos: devuelve los 50 íntegros tras el cierre recuperado', refund.monto === 50);
 }
 
 const listo = (puerto) => fetch(`http://localhost:${puerto}/actuator/health/readiness`).then((r) => r.ok).catch(() => false);
@@ -477,14 +849,16 @@ async function resiliencia() {
 
 async function independenciaDeDatos() {
   historia('10. Independencia de datos');
-  const servicios = ['identidad', 'catalogo', 'reservas', 'prestamos', 'pagos', 'notificaciones', 'reputacion'].map((s) => `lendup_${s}`);
-  const tabla = { lendup_identidad: 'usuarios', lendup_catalogo: 'publicaciones', lendup_reservas: 'reservas', lendup_prestamos: 'prestamos', lendup_pagos: 'garantias', lendup_notificaciones: 'notificaciones', lendup_reputacion: 'calificaciones' };
-  for (const propio of ['lendup_prestamos', 'lendup_pagos', 'lendup_notificaciones']) {
+  const servicios = ['identidad', 'catalogo', 'reservas', 'prestamos', 'pagos', 'notificaciones', 'reputacion', 'evidencias'].map((s) => `lendup_${s}`);
+  const tabla = { lendup_identidad: 'usuarios', lendup_catalogo: 'publicaciones', lendup_reservas: 'reservas', lendup_prestamos: 'prestamos', lendup_pagos: 'garantias', lendup_notificaciones: 'notificaciones', lendup_reputacion: 'calificaciones', lendup_evidencias: 'incidencias' };
+  for (const propio of ['lendup_prestamos', 'lendup_pagos', 'lendup_notificaciones', 'lendup_evidencias']) {
     const r = sql(propio, `select count(*) from ${propio}.${tabla[propio]}`);
     check(`MySQL: ${propio} lee su propio esquema`, r.ok && Number(r.out) > 0, `${r.out} filas`);
     const ajenos = servicios.filter((s) => s !== propio).map((s) => [s, sql(propio, `select count(*) from ${s}.${tabla[s]}`)]);
     check(`MySQL: ${propio} no puede leer ninguno de los otros ${ajenos.length} esquemas`, ajenos.every(([, x]) => !x.ok && /denied/.test(x.out)), ajenos[0][1].out);
   }
+  check('MySQL: Evidencias está en la revisión de Alembic esperada',
+    evidenceSql('select version_num from lendup_evidencias.alembic_version').out === '0005_incident_seal_generation');
 }
 
 // Rutas de services/api/endpoints.ts del frontend y a qué servicio deben llegar por el gateway.
@@ -510,9 +884,14 @@ async function rutasDelFrontend() {
     }
     check(`${servicio}: ${lista.length} rutas llegan a su servicio`, malas.length === 0, malas.join('; ') || 'ninguna al monolito');
   }
-  const pendientes = [`POST /prestamos/${x}/evidencias`, `POST /prestamos/${x}/analisis-evidencias`, 'GET /incidencias', 'GET /admin/incidencias'];
-  const estados = await Promise.all(pendientes.map(async (r) => (await call(r.split(' ')[0], r.split(' ')[1], BORROWER, r.startsWith('GET') ? undefined : {})).status));
-  check('Evidencias: sus rutas siguen en el monolito hasta que exista EVIDENCE_SERVICE_URL', estados.every((s) => s === 418), estados.join(', '));
+  const evidencia = [
+    ['POST', `/prestamos/${x}/evidencias`, 400], ['POST', `/prestamos/${x}/analisis-evidencias`, 422],
+    ['GET', '/incidencias', 200], ['GET', '/admin/incidencias', 403],
+  ];
+  const estados = await Promise.all(evidencia.map(async ([method, path]) =>
+    (await call(method, path, BORROWER, method === 'GET' ? undefined : {})).status));
+  check('Evidencias: las rutas del frontend llegan al servicio real a través del Gateway',
+    estados.every((status, i) => status === evidencia[i][2]), estados.join(', '));
 }
 
 async function outboxes() {
@@ -522,6 +901,7 @@ async function outboxes() {
     lendup_prestamos: 'select count(*) from lendup_prestamos.outbox_events where published_at is null',
     lendup_pagos: 'select count(*) from lendup_pagos.outbox_events where published_at is null',
     lendup_reputacion: 'select count(*) from lendup_reputacion.outbox_events where published_at is null',
+    lendup_evidencias: 'select count(*) from lendup_evidencias.outbox_events where published_at is null',
   };
   for (const [esquema, consulta] of Object.entries(pendientes)) {
     const r = await until(`el outbox de ${esquema} en 0`, async () => { const q = sql(esquema, consulta); return q.ok && q.out === '0' && q; }, 45).catch(() => sql(esquema, consulta));
@@ -535,14 +915,23 @@ const deadLetters = async () => Object.fromEntries((await rabbit('GET', '/queues
 try {
   await until('que arranquen todos los servicios', async () => {
     const java = await Promise.all([8081, 8082, 8083, 8087, 8090].map(listo));
-    const otros = await Promise.all(['http://localhost:8085/health', 'http://localhost:8084/health', 'http://localhost:8086/health/ready', 'http://localhost:9099/'].map((u) => fetch(u).then((r) => r.ok).catch(() => false)));
+    const otros = await Promise.all(['http://localhost:8085/health', 'http://localhost:8084/health', 'http://localhost:8086/health/ready', 'http://localhost:8088/health', 'http://localhost:9099/'].map((u) => fetch(u).then((r) => r.ok).catch(() => false)));
     return [...java, ...otros].every(Boolean);
   }, 180);
+  await until('las colas de Evidencias', async () => {
+    const queues = await rabbit('GET', '/queues');
+    return ['evidence.events.v1', 'evidence.events.v1.dlq'].every((name) => queues.some((q) => q.name === name));
+  });
+  if (compose('exec', '-T', 'payments', 'printenv', 'MERCADOPAGO_MODE').trim() !== 'simulado') {
+    throw new Error('La suite requiere el modo simulado de Mercado Pago');
+  }
   await rabbit('PUT', `/queues/%2F/${SPY}`, { durable: false, arguments: { 'x-max-length': 2000 } });
   await rabbit('POST', `/bindings/%2F/e/lendup.domain.events/q/${SPY}`, { routing_key: '#' });
   await rabbit('DELETE', `/queues/%2F/${SPY}/contents`);
   deadBefore = await deadLetters();
-  for (const s of [identidadYCatalogo, solicitudes, cicloCompleto, cancelacion, cancelacionRechazada, cambiosDeFecha, vencimiento, retencionExpirada, incidencias, incidenciaConRetencionTotal, resiliencia, independenciaDeDatos, rutasDelFrontend, outboxes]) await s();
+  for (const s of [identidadYCatalogo, solicitudes, cicloCompleto, cancelacion, cancelacionRechazada, cambiosDeFecha, vencimiento,
+    retencionExpirada, incidencias, incidenciaConRetencionTotal, concurrenciaYOutbox, recuperacionConIncidencia, cierreTrasRollback, resiliencia,
+    independenciaDeDatos, rutasDelFrontend, outboxes]) await s();
 } catch (e) { failed = e; console.error('\n' + e.message); }
 
 historia('13. Broker');
@@ -557,6 +946,12 @@ const dead = queues.filter((q) => q.name.endsWith('.dlq') && q.messages > (deadB
 console.log('\nEventos por routing key:'); Object.entries(seen).sort().forEach(([k, n]) => console.log(`  ${String(n).padStart(3)}  ${k}`));
 if (!failed) try {
   check('Ninguna DLQ recibió mensajes durante la prueba', dead.length === 0, dead.map((q) => `${q.name}=${q.messages}`).join(', ') || 'ninguno');
+  const deadLettersNow = queues.filter((q) => q.name.endsWith('.dlq'));
+  check('Las seis DLQ están vacías', deadLettersNow.length === 6 && deadLettersNow.every((q) => q.messages === 0));
+  check('Evidencias: sus colas de mensajes y DLQ existen y están vacías',
+    ['evidence.events.v1', 'evidence.events.v1.dlq'].every((name) => queues.some((q) => q.name === name && q.messages === 0)));
+  check('Evidencias: el Broker observó los tres tipos de evento del productor real',
+    ['evidencia-registrada', 'incidencia-reportada', 'incidencia-resuelta'].every((tipo) => seen[`evidencias.${tipo}.v1`] > 0));
   const propias = ['prestamos.creado.v1', 'prestamos.objeto-entregado.v1', 'prestamos.activado.v1', 'prestamos.extension-solicitada.v1', 'prestamos.extension-aceptada.v1', 'prestamos.extension-rechazada.v1', 'prestamos.reprogramacion-propuesta.v1', 'prestamos.reprogramacion-rechazada.v1',
     'prestamos.fecha-devolucion-actualizada.v1', 'prestamos.devolucion-registrada.v1', 'prestamos.vencido.v1', 'prestamos.finalizado.v1', 'prestamos.cancelado.v1', 'prestamos.cancelacion-rechazada.v1', 'prestamos.periodo-liberado.v1',
     'pagos.pago-confirmado.v1', 'pagos.pago-rechazado.v1', 'pagos.garantia-constituida.v1', 'pagos.tarifa-liberada.v1', 'pagos.garantia-devuelta.v1', 'pagos.garantia-retenida.v1', 'pagos.reembolso-procesado.v1'];
@@ -574,10 +969,11 @@ if (!failed) try {
 
 mkdirSync(resolve(root, 'reportes'), { recursive: true });
 const ok = results.filter((r) => r.ok).length;
-writeFileSync(resolve(root, 'reportes', 'e2e-coordinado.md'), [`# Prueba de punta a punta de LendUp`, '', `Fecha: ${new Date().toISOString()}  `, `Resultado: **${failed ? 'FALLÓ: ' + failed.message : `${ok}/${results.length} verificaciones en verde`}**`, '',
-  'Reales: Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación, API Gateway, MySQL y RabbitMQ. Firebase es el emulador oficial y Mercado Pago el modo simulado. Evidencias usa rutas del stub y su suite publica los eventos manualmente.', '',
+const reportPath = resolve(root, 'reportes', 'e2e-ocho-microservicios.md');
+writeFileSync(reportPath, [`# Prueba de punta a punta de LendUp`, '', `Fecha (Lima) ${new Intl.DateTimeFormat('sv-SE', { dateStyle: 'short', timeStyle: 'medium', timeZone: 'America/Lima' }).format(new Date())}`, `Resultado **${failed ? 'FALLÓ: ' + failed.message : `${ok}/${results.length} verificaciones en verde`}**`, '',
+  'Identidad, Catálogo, Reservas, Préstamos, Pagos, Notificaciones, Reputación y Evidencias se ejecutaron a través del Gateway. MySQL y RabbitMQ son reales. Firebase usa el emulador oficial. Mercado Pago, Cloudinary y Gemini tienen dobles locales.', '',
   ...[...new Set(results.map((r) => r.story))].flatMap((s) => [`## ${s}`, '', '| Verificación | Resultado | Detalle |', '|---|---|---|', ...results.filter((r) => r.story === s).map((r) => `| ${r.name} | ${r.ok ? 'OK' : 'FALLA'} | ${r.detail.replaceAll('|', '/')} |`), '']),
   '## Eventos que pasaron por RabbitMQ', '', '| Routing key | Cantidad |', '|---|---|', ...Object.entries(seen).sort().map(([k, n]) => `| \`${k}\` | ${n} |`), '',
   '## Colas', '', '| Cola | Mensajes pendientes |', '|---|---|', ...queues.map((q) => `| \`${q.name}\` | ${q.messages ?? 0} |`), ''].join('\n'));
-console.log(`\n${failed ? 'FALLÓ' : 'TODO EN VERDE'}: ${ok}/${results.length} verificaciones. Reporte: ${resolve(root, 'reportes', 'e2e-coordinado.md')}`);
+console.log(`\n${failed ? 'FALLÓ' : 'TODO EN VERDE'}: ${ok}/${results.length} verificaciones. Reporte: ${reportPath}`);
 process.exit(failed ? 1 : 0);
