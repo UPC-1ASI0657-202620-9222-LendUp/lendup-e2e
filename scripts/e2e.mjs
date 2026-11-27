@@ -805,6 +805,9 @@ async function cierreTrasRollback() {
   expect('Evidencias: revisa la incidencia tras recuperar la admisión', await administrar(incident, 'revision'), 200);
   expect('Evidencias: resuelve sin afectación tras el rollback', await resolver(incident, 'SIN_AFECTACION', 0), 200);
   await until('que Préstamos proyecte la resolución tras el rollback', async () =>
+    sql('lendup_prestamos',
+      `select resolved from lendup_prestamos.loan_incident_projection where incident_id='${incident}'`
+    ).out === '1' &&
     (await snapshot()).estado_detalle === 'DEVOLUCION_REGISTRADA');
   const finished = await call('POST', path, LENDER);
   expect('Préstamos: el siguiente cierre confirma la devolución', finished, 200, (b) => b.estado === 'FINALIZADO');
